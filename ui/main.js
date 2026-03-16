@@ -1,13 +1,13 @@
 const { listen } = window.__TAURI__.event;
 const { invoke } = window.__TAURI__.core;
 
-// State management
+// state management
 let myPeerId = null;
 let activeChatPeerId = null;
-let peers = new Map(); // PeerId -> { name, status, lastMessage, avatar }
-let messagesByPeer = new Map(); // PeerId -> [ { text, sent, time } ]
+let peers = new Map(); // peer id to metadata
+let messagesByPeer = new Map(); // messages grouped by peer
 
-// DOM Elements
+// dom elements
 const myPeerIdEl = document.getElementById('my-peer-id');
 const contactsListEl = document.getElementById('contacts-list');
 const activeChatEl = document.getElementById('active-chat');
@@ -20,28 +20,29 @@ const chatAvatarEl = document.getElementById('chat-avatar');
 const backBtn = document.getElementById('back-btn');
 const appWrapper = document.querySelector('.app-wrapper');
 
-// Modal Elements
+// modal elements
 const addFriendBtn = document.getElementById('add-friend-btn');
 const addFriendModal = document.getElementById('add-friend-modal');
 const friendIdInput = document.getElementById('friend-id-input');
 const confirmAddFriend = document.getElementById('confirm-add-friend');
 const cancelModal = document.getElementById('cancel-modal');
 
-// QR Code Elements
-const myAvatar = document.querySelector('.sidebar-header .avatar');
-const qrModal = document.getElementById('qr-modal');
 const closeQrModal = document.getElementById('close-qr-modal');
 const qrPeerIdDisplay = document.getElementById('qr-peer-id');
 let qrCodeInstance = null;
 
-// Initialize
-async function init() {
-    console.log('Initializing JS...');
+// qr code stuff
+const myAvatar = document.querySelector('.sidebar-header .avatar');
+const qrModal = document.getElementById('qr-modal');
 
-    // Listen for P2P Events
+// start things up
+async function init() {
+    console.log('initializing js');
+
+    // listen for p2p events
     await listen('p2p-event', (event) => {
         const payload = event.payload;
-        console.log('Got P2P Event:', payload);
+        console.log('got p2p event', payload);
 
         if (payload.event_type === 'MessageReceived') {
             handleIncomingMessage(payload.peer_id, payload.content);
@@ -50,20 +51,20 @@ async function init() {
         } else if (payload.event_type === 'PeerExpired') {
             handlePeerExpired(payload.peer_id);
         } else if (payload.event_type === 'ListenAddress') {
-            // Address logic if needed
+            // handle address if we need to
         }
     });
 
-    // We need our own Peer ID
+    // get our identity
     try {
-        console.log('Invoking get_my_peer_id...');
+        console.log('fetching peer id');
         myPeerId = await invoke('get_my_peer_id');
-        console.log('My Peer ID:', myPeerId);
+        console.log('got my id', myPeerId);
         if (myPeerId) {
             myPeerIdEl.textContent = myPeerId;
         }
     } catch (e) {
-        console.error('Failed to get my Peer ID:', e);
+        console.error('failed to get id', e);
         myPeerIdEl.textContent = "Error: " + e;
     }
 }
@@ -98,12 +99,12 @@ function handleIncomingMessage(peerId, content) {
     const msg = { text: content, sent: false, time };
     messagesByPeer.get(peerId).push(msg);
 
-    // Update peer last message
+    // save last message info
     if (peers.has(peerId)) {
         peers.get(peerId).lastMessage = content;
         peers.get(peerId).status = 'online';
     } else {
-        // Discovered via message
+        // new peer found via message
         handlePeerDiscovered(peerId);
         peers.get(peerId).lastMessage = content;
     }
@@ -145,7 +146,7 @@ function selectChat(peerId) {
     chatNameEl.textContent = peer.name;
     chatAvatarEl.src = peer.avatar;
 
-    // Mobile logic: transition to chat view
+    // slide into chat view on mobile
     appWrapper.classList.add('mobile-chat-active');
 
     renderContactsList();
@@ -169,13 +170,13 @@ function renderMessages() {
     messageListEl.scrollTop = messageListEl.scrollHeight;
 }
 
-// UI Actions
+// user actions
 async function sendMessage() {
     const text = messageInput.value.trim();
     if (!text || !activeChatPeerId) return;
 
     try {
-        await invoke('send_p2p_message', { content: text }); // Note: simplified backend just broadcasts
+        await invoke('send_p2p_message', { content: text }); // backend just broadcasts for now
 
         const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         if (!messagesByPeer.has(activeChatPeerId)) {
@@ -196,7 +197,7 @@ async function sendMessage() {
     }
 }
 
-// Modal Handlers
+// modal logic
 addFriendBtn.onclick = () => addFriendModal.classList.remove('hidden');
 cancelModal.onclick = () => addFriendModal.classList.add('hidden');
 
@@ -210,17 +211,17 @@ confirmAddFriend.onclick = () => {
     }
 };
 
-// QR Modal Handlers
+// qr code logic
 myAvatar.onclick = () => {
     if (!myPeerId) return;
 
     qrPeerIdDisplay.textContent = myPeerId;
     qrModal.classList.remove('hidden');
 
-    // Clear previous QR
+    // wipe old qr
     document.getElementById('qrcode').innerHTML = "";
 
-    // Create new QR
+    // generate fresh qr code
     qrCodeInstance = new QRCode(document.getElementById("qrcode"), {
         text: myPeerId,
         width: 256,
@@ -244,13 +245,13 @@ messageInput.onkeypress = (e) => {
     if (e.key === 'Enter') sendMessage();
 };
 
-// Initialize on load
+// wait for dom then start
 window.addEventListener('DOMContentLoaded', () => {
-    console.log('DOM Content Loaded');
-    // Check if __TAURI__ is available
+    console.log('dom is ready');
+    // make sure tauri is there
     if (window.__TAURI__) {
         init();
     } else {
-        console.error('Tauri API not found. Running in browser?');
+        console.error('tauri missing maybe browser mode');
     }
 });

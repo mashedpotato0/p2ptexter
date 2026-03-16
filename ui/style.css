@@ -31,7 +31,7 @@ body {
     box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
 }
 
-/* Sidebar */
+/* sidebar */
 .sidebar {
     width: 35%;
     max-width: 450px;
@@ -168,7 +168,7 @@ body {
     overflow: hidden;
 }
 
-/* Chat Window */
+/* chat window */
 .chat-window {
     flex: 1;
     background-color: var(--bg-chat);
@@ -297,7 +297,7 @@ body {
     padding: 10px;
 }
 
-/* Modal */
+/* modals */
 .modal {
     position: fixed;
     top: 0;
@@ -392,13 +392,14 @@ body {
     border-radius: 50%;
     background-color: #313d45;
     cursor: pointer;
+    /* user can click avatar for qr */
 }
 
 .hidden {
     display: none !important;
 }
 
-/* Mobile Responsiveness */
+/* mobile stuff */
 @media (max-width: 768px) {
     .app-wrapper {
         position: relative;
@@ -424,7 +425,7 @@ body {
         transition: transform 0.3s ease-in-out;
     }
 
-    /* State when chat is active on mobile */
+    /* when chat is open on mobile */
     .app-wrapper.mobile-chat-active .sidebar {
         transform: translateX(-100%);
     }
@@ -453,11 +454,11 @@ body {
 
     .no-chat {
         display: none !important;
-        /* Always hide welcome screen on mobile when transitioning to chat */
+        /* hide welcome content while chatting on mobile */
     }
 }
 
-/* Custom Scrollbar */
+/* nice scrollbars */
 ::-webkit-scrollbar {
     width: 6px;
 }

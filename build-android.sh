@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Configuration
+# config
 APK_PATH="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
 ALIGNED_APK="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-p2p-aligned.apk"
 SIGNED_APK="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-p2p-signed.apk"
@@ -8,36 +8,36 @@ KEYSTORE="/tmp/p2p-dev.keystore"
 ALIAS="p2p-dev"
 PASS="password"
 
-# Tool Paths (detected from your system)
+# where the tools are
 ZIPALIGN="/home/mashedpotato/Android/Sdk/build-tools/35.0.0/zipalign"
 APKSIGNER="/home/mashedpotato/Android/Sdk/build-tools/35.0.0/apksigner"
 
-echo "🚀 Starting P2P Texter Android Build..."
+echo "starting android build"
 
-# 1. Run the Tauri Build
+# build standard tauri stuff
 cargo tauri android build
 
-# 2. Check if APK was generated
+# make sure apk is there
 if [ ! -f "$APK_PATH" ]; then
-    echo "❌ Build failed - Unsigned APK not found"
+    echo "build failed apk not found"
     exit 1
 fi
 
-# 3. Create a keystore if it doesn't exist
+# prep keystore
 if [ ! -f "$KEYSTORE" ]; then
-    echo "🔑 Generating temporary development keystore..."
+    echo "generating dev keystore"
     keytool -genkey -v -keystore "$KEYSTORE" -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=P2PDev, OU=Dev, O=Dev, L=Dev, S=Dev, C=US"
 fi
 
-# 4. Zipalign (required before apksigner)
-echo "📦 Aligning the APK..."
+# align it
+echo "aligning apk"
 rm -f "$ALIGNED_APK"
 "$ZIPALIGN" -v 4 "$APK_PATH" "$ALIGNED_APK"
 
-# 5. Sign with apksigner (V2/V3 signing)
-echo "✍️ Signing with apksigner..."
+# sign it
+echo "signing with apksigner"
 rm -f "$SIGNED_APK"
 "$APKSIGNER" sign --ks "$KEYSTORE" --ks-pass "pass:$PASS" --out "$SIGNED_APK" "$ALIGNED_APK"
 
-echo "✅ Success! Your VALID installable APK is at:"
+echo "done apk is ready at"
 echo "$SIGNED_APK"

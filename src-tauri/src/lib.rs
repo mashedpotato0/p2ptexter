@@ -153,7 +153,7 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = run_p2p(handle, msg_rx, local_key).await {
-                    eprintln!("P2P run error: {:?}", e);
+                    eprintln!("p2p run error {:?}", e);
                 }
             });
             Ok(())
