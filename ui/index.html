@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P Texter (WhatsApp Style)</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Segoe+UI:wght@300;400;600&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+
+<body class="dark-theme">
+    <div class="app-wrapper">
+        <aside class="sidebar">
+            <header class="sidebar-header">
+                <div class="user-profile">
+                    <img src="https://api.dicebear.com/7.x/bottts/svg?seed=You" alt="Me" class="avatar">
+                    <div class="user-id-info">
+                        <span class="label">My ID:</span>
+                        <span id="my-peer-id" class="peer-id-hash">Checking...</span>
+                    </div>
+                </div>
+                <div class="actions">
+                    <button id="add-friend-btn" title="Add Friend">
+                        <svg viewBox="0 0 24 24" width="24" height="24">
+                            <path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
+                        </svg>
+                    </button>
+                </div>
+            </header>
+            <div class="search-bar">
+                <input type="text" placeholder="Search or start new chat">
+            </div>
+            <div class="contacts-list" id="contacts-list">
+                <!-- Contacts will be populated here -->
+            </div>
+        </aside>
+
+        <main class="chat-window">
+            <div id="no-chat-selected" class="no-chat">
+                <div class="welcome-content">
+                    <div class="p2p-icon">P2P</div>
+                    <h1>P2P Texter for Desktop</h1>
+                    <p>Send and receive messages without a central server. Your messages are end-to-end encrypted and
+                        decentralized.</p>
+                </div>
+            </div>
+
+            <div id="active-chat" class="active-chat hidden">
+                <header class="chat-header">
+                    <button id="back-btn" class="back-btn" title="Back to Contacts">
+                        <svg viewBox="0 0 24 24" width="24" height="24">
+                            <path fill="currentColor"
+                                d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
+                        </svg>
+                    </button>
+                    <div class="contact-info">
+                        <img src="" id="chat-avatar" class="avatar">
+                        <div class="contact-details">
+                            <h2 id="chat-name">Contact</h2>
+                            <span id="chat-status">online</span>
+                        </div>
+                    </div>
+                </header>
+                <div id="message-list" class="message-list">
+                    <!-- Messages will be grouped here -->
+                </div>
+                <footer class="input-area">
+                    <input type="text" id="message-input" placeholder="Type a message" autocomplete="off">
+                    <button id="send-btn">
+                        <svg viewBox="0 0 24 24" width="24" height="24">
+                            <path fill="currentColor" d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+                        </svg>
+                    </button>
+                </footer>
+            </div>
+        </main>
+    </div>
+
+    <!-- Add Friend Modal -->
+    <div id="add-friend-modal" class="modal hidden">
+        <div class="modal-content">
+            <h2>Add New Friend</h2>
+            <p>Paste your friend's Peer ID (Hash) below:</p>
+            <input type="text" id="friend-id-input" placeholder="12D3KooW...">
+            <div class="modal-actions">
+                <button id="cancel-modal">Cancel</button>
+                <button id="confirm-add-friend" class="primary">Add Friend</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- QR Code Modal -->
+    <div id="qr-modal" class="modal hidden">
+        <div class="modal-content qr-content">
+            <h2>Your Peer ID QR Code</h2>
+            <div id="qrcode"></div>
+            <p id="qr-peer-id" class="peer-id-hash"></p>
+            <div class="modal-actions">
+                <button id="close-qr-modal">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="main.js"></script>
+</body>
+
+</html>

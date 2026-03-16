@@ -1,0 +1,9 @@
+# Permission definition for the P2P application
+[[permission]]
+identifier = "allow-send-p2p-message"
+description = "Allows sending messages via P2P"
+commands.allow = ["send_p2p_message"]
+[[permission]]
+identifier = "allow-get-my-peer-id"
+description = "Allows retrieving the local Peer ID"
+commands.allow = ["get_my_peer_id"]
