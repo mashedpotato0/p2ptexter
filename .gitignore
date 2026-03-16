@@ -1,7 +1,26 @@
+# tauri and rust
 /target
 /src-tauri/target
+/src-tauri/gen
+/src-tauri/Cargo.lock
+
+# web stuff
 node_modules
-.DS_Store
-*.log
-.env
 dist
+.env*
+*.log
+
+# android
+*.iml
+.gradle
+local.properties
+captures
+.externalNativeBuild
+.cxx
+
+# ides and os
+.DS_Store
+.idea
+.vscode
+*.swp
+*~
