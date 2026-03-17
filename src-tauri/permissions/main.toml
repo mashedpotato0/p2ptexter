@@ -16,19 +16,14 @@ identifier = "allow-set-nickname"
 description = "Allows setting the local nickname"
 commands.allow = ["set_nickname"]
 [[permission]]
-identifier = "allow-get-unread-count"
-description = "Allows retrieving unread message counts"
-commands.allow = ["get_unread_count"]
+identifier = "allow-generate-qr"
+description = "Allows generating QR tokens"
+commands.allow = ["generate_qr"]
 
 [[permission]]
-identifier = "allow-dial-address"
-description = "Allows dialing a peer by Multiaddr"
-commands.allow = ["dial_address"]
-
-[[permission]]
-identifier = "allow-dial-peer"
-description = "Allows dialing a peer by Peer ID"
-commands.allow = ["dial_peer"]
+identifier = "allow-scan-qr"
+description = "Allows scanning QR tokens"
+commands.allow = ["scan_qr"]
 
 [[permission]]
 identifier = "allow-reset-identity"

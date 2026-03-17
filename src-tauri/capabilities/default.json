@@ -11,9 +11,8 @@
     "allow-get-my-peer-id",
     "allow-get-nickname",
     "allow-set-nickname",
-    "allow-get-unread-count",
-    "allow-dial-address",
-    "allow-dial-peer",
+    "allow-generate-qr",
+    "allow-scan-qr",
     "allow-reset-identity",
     "store:default"
   ]

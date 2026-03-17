@@ -24,3 +24,10 @@ captures
 .vscode
 *.swp
 *~
+bootstrap_server/target/
+build/
+*.apk
+*.AppImage
+*.deb
+*.rpm
+*.aab

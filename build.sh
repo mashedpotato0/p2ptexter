@@ -8,7 +8,7 @@ if ! command -v cargo-tauri >/dev/null 2>&1; then
     echo "Installing tauri-cli..."
     cargo install tauri-cli
 fi
-
+#34.41.180.29
 # ── Paths & Config ───────────────────────────────────────────────────────────
 ZIPALIGN="/home/mashedpotato/Android/Sdk/build-tools/35.0.0/zipalign"
 APKSIGNER="/home/mashedpotato/Android/Sdk/build-tools/35.0.0/apksigner"
@@ -21,6 +21,14 @@ APK_ALIGNED="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-p
 APK_SIGNED="src-tauri/gen/android/app/build/outputs/apk/universal/release/p2p-signed.apk"
 
 # ── Build ─────────────────────────────────────────────────────────────────────
+# Ensure Android NDK toolchain is in PATH for cc-rs/cross-compilation
+NDK_ROOT="/home/mashedpotato/Android/Sdk/ndk/29.0.13846066"
+NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+export PATH="$NDK_BIN:$PATH"
+
+# Set explicit compilers for cross-compilation (helps crates like 'ring' and 'cc')
+export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android29-clang"
+export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
 
 # Run Linux build
 echo "Building Linux executable..."

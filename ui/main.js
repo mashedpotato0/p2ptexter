@@ -1,8 +1,21 @@
+console.log('main.js: script loading');
 const { listen } = window.__TAURI__.event;
 const { invoke } = window.__TAURI__.core;
-const { LazyStore } = window.__TAURI__.store;
 
-const store = new LazyStore(".settings.dat");
+let store = null;
+if (window.__TAURI__.store) {
+    console.log('main.js: store plugin found');
+    const { LazyStore, Store } = window.__TAURI__.store;
+    const StoreClass = LazyStore || Store;
+    if (StoreClass) {
+        store = new StoreClass(".settings.dat");
+        console.log('main.js: store instance created');
+    } else {
+        console.error('main.js: neither LazyStore nor Store found in window.__TAURI__.store');
+    }
+} else {
+    console.error('main.js: window.__TAURI__.store is undefined');
+}
 
 // ── app state ────────────────────────────────────────────────────────────────
 let myPeerId = null;
@@ -51,8 +64,6 @@ const qrModal = document.getElementById('qr-modal');
 const closeQrModal = document.getElementById('close-qr-modal');
 const qrPeerIdEl = document.getElementById('qr-peer-id');
 let qrInstance = null;
-
-// qr scanner
 const scanQrBtn = document.getElementById('scan-qr-btn');
 const qrScannerModal = document.getElementById('qr-scanner-modal');
 const closeScannerModal = document.getElementById('close-scanner-modal');
@@ -63,8 +74,7 @@ const settingsBtn = document.getElementById('settings-btn');
 const settingsModal = document.getElementById('settings-modal');
 const closeSettingsBtn = document.getElementById('close-settings-btn');
 const resetAppBtn = document.getElementById('reset-app-btn');
-const bootstrapInput = document.getElementById('bootstrap-input');
-const confirmBootstrap = document.getElementById('confirm-bootstrap');
+const bootstrapUrlInput = document.getElementById('bootstrap-url-input');
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 function avatarUrl(seed) {
@@ -77,7 +87,7 @@ function timeStr() {
 
 // ── initialise ───────────────────────────────────────────────────────────────
 async function init() {
-    console.log('init starting up');
+    console.log('main.js: init starting up');
 
     // listen for all p2p events from rust
     await listen('p2p-event', (event) => {
@@ -91,43 +101,56 @@ async function init() {
             case 'MessageReceived': onMessageReceived(p.peer_id, p.content, p.nickname); break;
             case 'KeyExchanged': onKeyExchanged(p.peer_id, p.nickname); break;
             case 'SyncComplete': onSyncComplete(p.peer_id, p.count); break;
+            case 'ListenAddress': renderQr(p.content); break; // content contains the QR token
+            case 'ScanResult': onScanResult(p.success, p.message); break;
             default: break;
         }
     });
 
     // load saved data from store
-    try {
-        const savedNick = await store.get('nickname');
-        if (savedNick) applyNickname(savedNick);
+    if (store) {
+        try {
+            const savedNick = await store.get('nickname');
+            if (savedNick) applyNickname(savedNick);
 
-        const savedPeers = await store.get('peers');
-        if (savedPeers) {
-            peers = new Map(Object.entries(savedPeers));
-            // marking all as offline initially until discovered or dialed
-            peers.forEach(p => {
-                p.status = 'offline';
-                p.e2eReady = false;
-            });
-            renderContactsList();
+            const savedPeers = await store.get('peers');
+            if (savedPeers) {
+                peers = new Map(Object.entries(savedPeers));
+                // marking all as offline initially until discovered or dialed
+                peers.forEach(p => {
+                    p.status = 'offline';
+                    p.e2eReady = false;
+                });
+                renderContactsList();
+            }
+
+            const savedMessages = await store.get('messages');
+            if (savedMessages) messages = new Map(Object.entries(savedMessages));
+
+            const savedBootstrapUrl = await store.get('bootstrap_url');
+            if (savedBootstrapUrl) {
+                bootstrapUrlInput.value = savedBootstrapUrl;
+                await invoke('set_bootstrap_url', { url: savedBootstrapUrl });
+            }
+
+            console.log('main.js: store loaded');
+        } catch (e) {
+            console.error('main.js: failed to load store', e);
         }
-
-        const savedMessages = await store.get('messages');
-        if (savedMessages) messages = new Map(Object.entries(savedMessages));
-
-        console.log('store loaded');
-    } catch (e) {
-        console.error('failed to load store', e);
+    } else {
+        console.warn('main.js: skipping store load - store is null');
     }
 
     // grab our peer id
     try {
+        console.log('main.js: invoking get_my_peer_id');
         myPeerId = await invoke('get_my_peer_id');
+        console.log('main.js: got peer id', myPeerId);
         myPeerIdEl.textContent = myPeerId;
         myAvatarEl.src = avatarUrl(myPeerId);
-        console.log('my peer id', myPeerId);
     } catch (e) {
         myPeerIdEl.textContent = 'error: ' + e;
-        console.error('failed to get peer id', e);
+        console.error('main.js: failed to get peer id', e);
     }
 
     // prompt for nickname if not set
@@ -141,6 +164,7 @@ async function saveState() {
         await store.set('nickname', myNickname);
         await store.set('peers', Object.fromEntries(peers));
         await store.set('messages', Object.fromEntries(messages));
+        await store.set('bootstrap_url', bootstrapUrlInput.value || "http://34.41.180.29:3000");
         await store.save();
     } catch (e) {
         console.error('failed to save state', e);
@@ -150,6 +174,15 @@ async function saveState() {
 function applyNickname(name) {
     myNickname = name;
     myNickEl.textContent = name;
+}
+
+function onScanResult(success, message) {
+    console.log('Scan result:', success, message);
+    if (success) {
+        alert('Success: ' + message);
+    } else {
+        alert('Scan failed: ' + message);
+    }
 }
 
 // ── peer events ───────────────────────────────────────────────────────────────
@@ -481,18 +514,14 @@ confirmAddFriend.onclick = async () => {
     addFriendModal.classList.add('hidden');
     selectChat(id);
 
-    // tell the backend to initiate key exchange or dial
+    // tell the backend to initiate scan or fallback
     try {
-        if (isMultiaddr) {
-            await invoke('dial_address', { address: input });
-        } else {
-            await invoke('dial_peer', { peer_id: id });
-        }
+        await invoke('scan_qr', { token: input });
     } catch (e) {
-        console.error('dial failed', e);
+        console.error('scan failed', e);
         if (p) {
             p.status = 'offline';
-            p.lastMsg = 'dial failed: ' + e;
+            p.lastMsg = 'scan failed: ' + e;
             renderContactsList();
         }
     }
@@ -501,38 +530,32 @@ confirmAddFriend.onclick = async () => {
 
 friendIdInput.onkeydown = (e) => { if (e.key === 'Enter') confirmAddFriend.click(); };
 
-// bootstrap network
-if (confirmBootstrap) {
-    confirmBootstrap.onclick = async () => {
-        const addr = bootstrapInput.value.trim();
-        if (!addr) return;
-        try {
-            await invoke('bootstrap', { address: addr });
-            alert('Bootstrap initiated. Joining network...');
-            bootstrapInput.value = '';
-            addFriendModal.classList.add('hidden');
-        } catch (e) {
-            console.error('bootstrap failed', e);
-            alert('Bootstrap failed: ' + e);
-        }
-    };
-}
+// bootstrap network (removed in favor of settings-based signaling)
 
 // qr code
-myAvatarWrap.onclick = () => {
+myAvatarWrap.onclick = async () => {
     if (!myPeerId) return;
     qrPeerIdEl.textContent = myPeerId;
+    document.getElementById('qrcode').innerHTML = 'Generating token...';
+    
+    // In the new system, we generate a TOKEN via bootstrap
+    await invoke('generate_qr', { validity: 900 }); // 15 mins
+    
+    qrModal.classList.remove('hidden');
+};
+
+// We listen for the token via p2p-event ListenAddress
+async function renderQr(token) {
     document.getElementById('qrcode').innerHTML = '';
     qrInstance = new QRCode(document.getElementById('qrcode'), {
-        text: myPeerId,
+        text: token,
         width: 220,
         height: 220,
         colorDark: '#00d4ff',
         colorLight: '#ffffff',
         correctLevel: QRCode.CorrectLevel.H,
     });
-    qrModal.classList.remove('hidden');
-};
+}
 
 closeQrModal.onclick = () => qrModal.classList.add('hidden');
 
@@ -636,14 +659,9 @@ if (resetAppBtn) {
         const confirmed = confirm("Are you ABSOLUTELY sure? This will delete all messages, contacts, and your Peer ID identity. The app will restart.");
         if (confirmed) {
             try {
-                // 1. Clear store
                 await store.clear();
                 await store.save();
-
-                // 2. Remove identity key on backend
                 await invoke('reset_identity');
-
-                // 3. Restart app
                 window.location.reload();
             } catch (e) {
                 console.error('reset failed', e);
@@ -653,15 +671,32 @@ if (resetAppBtn) {
     };
 }
 
+if (bootstrapUrlInput) {
+    bootstrapUrlInput.onchange = async () => {
+        const url = bootstrapUrlInput.value;
+        if (url) {
+            await invoke('set_bootstrap_url', { url });
+            await saveState();
+            console.log('bootstrap url updated', url);
+        }
+    };
+}
+
 // ── boot ──────────────────────────────────────────────────────────────────────
-window.addEventListener('DOMContentLoaded', () => {
-    console.log('dom ready');
-    if (window.__TAURI__) {
-        init();
-    } else {
-        console.error('tauri not found — browser mode may have limited functionality');
-        // show nickname modal in browser preview too
-        nicknameModal.classList.remove('hidden');
-        myPeerIdEl.textContent = 'browser-preview';
+window.addEventListener('DOMContentLoaded', async () => {
+    console.log('main.js: DOMContentLoaded');
+    try {
+        if (window.__TAURI__) {
+            console.log('main.js: tauri detected, calling init()');
+            await init();
+            console.log('main.js: init() completed');
+        } else {
+            console.warn('main.js: tauri not found — browser mode');
+            nicknameModal.classList.remove('hidden');
+            myPeerIdEl.textContent = 'browser-preview';
+        }
+    } catch (e) {
+        console.error('main.js: FATAL error during boot', e);
+        if (myPeerIdEl) myPeerIdEl.textContent = 'FATAL error: ' + e;
     }
 });
