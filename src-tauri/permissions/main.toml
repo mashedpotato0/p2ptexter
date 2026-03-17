@@ -7,3 +7,30 @@ commands.allow = ["send_p2p_message"]
 identifier = "allow-get-my-peer-id"
 description = "Allows retrieving the local Peer ID"
 commands.allow = ["get_my_peer_id"]
+[[permission]]
+identifier = "allow-get-nickname"
+description = "Allows retrieving the local nickname"
+commands.allow = ["get_nickname"]
+[[permission]]
+identifier = "allow-set-nickname"
+description = "Allows setting the local nickname"
+commands.allow = ["set_nickname"]
+[[permission]]
+identifier = "allow-get-unread-count"
+description = "Allows retrieving unread message counts"
+commands.allow = ["get_unread_count"]
+
+[[permission]]
+identifier = "allow-dial-address"
+description = "Allows dialing a peer by Multiaddr"
+commands.allow = ["dial_address"]
+
+[[permission]]
+identifier = "allow-dial-peer"
+description = "Allows dialing a peer by Peer ID"
+commands.allow = ["dial_peer"]
+
+[[permission]]
+identifier = "allow-reset-identity"
+description = "Allows resetting the local identity"
+commands.allow = ["reset_identity"]

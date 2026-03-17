@@ -1,7 +1,11 @@
 {
-  "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "enables the default permissions",
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "mobile-capability",
+  "description": "enables permissions for the mobile application",
+  "platforms": [
+    "android",
+    "iOS"
+  ],
   "windows": [
     "main"
   ],
