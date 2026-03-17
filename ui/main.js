@@ -669,10 +669,8 @@ if (resetAppBtn) {
         if (confirmed) {
             try {
                 await store.clear();
-                await store.save();
                 await invoke('reset_identity');
-                alert("Identity reset. Please RESTART THE APP (close it and reopen) for the changes to take full effect.");
-                window.location.reload();
+                // The app will exit now, so we don't need reload
             } catch (e) {
                 console.error('reset failed', e);
                 alert('Reset failed: ' + e);

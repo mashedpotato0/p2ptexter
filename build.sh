@@ -86,12 +86,17 @@ BUILD_DIR="./build"
 mkdir -p "$BUILD_DIR" 
 
 if [ "$BUILD_APPIMAGE" = true ]; then
-    find src-tauri/target/release/bundle -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) -exec cp {} "$BUILD_DIR/" \;
+    # Force remove old AppImage if busy/locked
+    find "$BUILD_DIR" -name "*.AppImage" -delete
+    find src-tauri/target/release/bundle -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) -exec cp -f {} "$BUILD_DIR/" \;
 fi
 
 if [ "$BUILD_APK" = true ]; then
-    [ -f "$APK_SIGNED" ] && cp "$APK_SIGNED" "$BUILD_DIR/"
-    find src-tauri/gen/android/app/build/outputs -type f -name "*.aab" -exec cp {} "$BUILD_DIR/" \;
+    if [ -f "$APK_SIGNED" ]; then
+        rm -f "$BUILD_DIR/$(basename "$APK_SIGNED")"
+        cp -f "$APK_SIGNED" "$BUILD_DIR/"
+    fi
+    find src-tauri/gen/android/app/build/outputs -type f -name "*.aab" -exec cp -f {} "$BUILD_DIR/" \;
 fi
 
 echo "Artifacts collected:"

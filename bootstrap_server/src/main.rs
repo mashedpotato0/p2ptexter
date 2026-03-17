@@ -22,6 +22,7 @@ struct ServerState {
     peer_ips: Mutex<HashMap<String, String>>,
     friend_lists: Mutex<HashMap<String, HashSet<String>>>,
     offline_pings: Mutex<HashMap<String, HashSet<String>>>,
+    punch_requests: Mutex<HashMap<String, HashSet<String>>>,
     secret_key: [u8; 32],
 }
 
@@ -74,6 +75,7 @@ struct PingReq {
 #[derive(Serialize)]
 struct StatusRes {
     unread_from: Vec<String>,
+    punch_from: Vec<String>,
 }
 
 // encrypt payload for qr code
@@ -193,8 +195,18 @@ async fn ping_offline(
     StatusCode::OK
 }
 
-// retrieve and clear pending pings for a peer
-async fn check_pings(
+// record a punch request (matchmaking for UDP)
+async fn request_punch(
+    State(state): State<Arc<ServerState>>,
+    Json(payload): Json<PingReq>, // Reuse PingReq (sender->target)
+) -> StatusCode {
+    let mut punches = state.punch_requests.lock().unwrap();
+    punches.entry(payload.target_peer_id).or_default().insert(payload.sender_peer_id);
+    StatusCode::OK
+}
+
+// retrieve and clear pending pings and punch requests for a peer
+async fn check_status(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<RegisterReq>,
 ) -> Json<StatusRes> {
@@ -204,7 +216,15 @@ async fn check_pings(
     } else {
         vec![]
     };
-    Json(StatusRes { unread_from: unread })
+
+    let mut punches = state.punch_requests.lock().unwrap();
+    let punch_reqs = if let Some(reqs) = punches.remove(&payload.peer_id) {
+        reqs.into_iter().collect()
+    } else {
+        vec![]
+    };
+
+    Json(StatusRes { unread_from: unread, punch_from: punch_reqs })
 }
 
 #[tokio::main]
@@ -229,6 +249,7 @@ async fn main() {
         peer_ips: Mutex::new(HashMap::new()),
         friend_lists: Mutex::new(HashMap::new()),
         offline_pings: Mutex::new(HashMap::new()),
+        punch_requests: Mutex::new(HashMap::new()),
         secret_key,
     });
 
@@ -238,7 +259,8 @@ async fn main() {
         .route("/qr/scan", post(scan_qr))
         .route("/peer/ip", post(get_ip))
         .route("/peer/ping", post(ping_offline))
-        .route("/peer/status", post(check_pings))
+        .route("/peer/punch", post(request_punch))
+        .route("/peer/status", post(check_status))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));

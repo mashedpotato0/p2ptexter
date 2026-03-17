@@ -10,8 +10,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use x25519_dalek::{PublicKey as X25519PublicKey, SharedSecret};
 
@@ -22,6 +21,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, SharedSecret};
 enum Envelope {
     Hello { from: String, pubkey: String, nickname: String },
     Msg { from: String, to: String, nonce: String, ciphertext: String, nickname: String, ts: u64 },
+    Punch { from: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -52,6 +52,9 @@ struct RegisterReq { peer_id: String }
 struct QrReq { peer_id: String, validity_secs: u64 }
 #[derive(Deserialize)]
 struct QrRes { encrypted_token: String }
+#[derive(Serialize)]
+struct ScanReq { scanner_peer_id: String, encrypted_token: String }
+
 #[derive(Deserialize)]
 struct ScanRes {
     success: bool,
@@ -66,7 +69,7 @@ struct IpRes { ip: Option<String> }
 #[derive(Serialize)]
 struct PingReq { sender_peer_id: String, target_peer_id: String }
 #[derive(Deserialize)]
-struct StatusRes { unread_from: Vec<String> }
+struct StatusRes { unread_from: Vec<String>, punch_from: Vec<String> }
 
 // ── shared state ─────────────────────────────────────────────────────────────
 
@@ -95,6 +98,7 @@ struct AppState {
     nickname: Arc<Mutex<String>>,
     bootstrap_url: Arc<Mutex<String>>,
     emitter: Arc<TauriEmitter>,
+    socket: Arc<UdpSocket>,
 }
 
 pub struct TauriEmitter {
@@ -138,6 +142,8 @@ fn derive_key(shared: &SharedSecret) -> [u8; 32] {
 // ── networking ───────────────────────────────────────────────────────────────
 
 async fn handle_connection(mut socket: TcpStream, state: Arc<AppState>) {
+    let peer_addr = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".into());
+    println!("Backend: Incoming P2P connection from {}", peer_addr);
     let mut buf = vec![0u8; 4096];
     match socket.read(&mut buf).await {
         Ok(n) if n > 0 => {
@@ -196,7 +202,11 @@ async fn send_direct_message(to_peer_id: &str, content: &str, state: Arc<AppStat
     
     let ip_res: IpRes = res.json().await?;
     if let Some(ip) = ip_res.ip {
+        println!("Backend: Resolved IP {} for peer {}. Attempting TCP connect...", ip, to_peer_id);
+        state.emitter.emit(P2PEvent::BootstrapStatus { status: format!("Connecting to {}:3001...", ip) });
+        
         let mut stream = TcpStream::connect(format!("{}:3001", ip)).await?;
+        println!("Backend: Connected to peer {} at {}:3001!", to_peer_id, ip);
         
         let key = state.peer_keys.lock().unwrap().get(to_peer_id).copied();
         if let Some(k) = key {
@@ -231,6 +241,8 @@ async fn send_direct_message(to_peer_id: &str, content: &str, state: Arc<AppStat
             Err("Key not found, sent Hello instead".into())
         }
     } else {
+        println!("Backend: Peer {} is currently offline according to bootstrap.", to_peer_id);
+        state.emitter.emit(P2PEvent::BootstrapStatus { status: format!("Peer {} is offline.", to_peer_id) });
         // Peer offline, send ping to bootstrap
         let bootstrap_url = state.bootstrap_url.lock().unwrap().clone();
         client.post(format!("{}/peer/ping", bootstrap_url))
@@ -281,26 +293,25 @@ pub async fn run_p2p(
         }
     });
 
+    let client = reqwest::Client::new();
+
     // Periodic registration with bootstrap
     let state_reg = state.clone();
     let local_peer_id_reg = local_peer_id.clone();
+    let client_reg = client.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        let client = reqwest::Client::new();
         loop {
             interval.tick().await;
             let bootstrap_url_str = state_reg.bootstrap_url.lock().unwrap().clone();
             println!("Backend: Registering with bootstrap at {}", bootstrap_url_str);
-            let _ = client.post(format!("{}/register", bootstrap_url_str))
+            let _ = client_reg.post(format!("{}/register", bootstrap_url_str))
                 .json(&RegisterReq { peer_id: local_peer_id_reg.clone() })
                 .send().await;
         }
     });
 
-    // Registration attempt immediately (optional as interval.tick() fires immediately in some versions, but explicit is better)
-    let _ = client.post(format!("{}/register", bootstrap_url.lock().unwrap()))
-        .json(&RegisterReq { peer_id: local_peer_id.clone() })
-        .send().await;
+    // Registration attempt immediately is handled by the first tick of the interval above
 
     // Periodic status check
     let state_check = state.clone();
@@ -313,8 +324,8 @@ pub async fn run_p2p(
             if let Ok(res) = c.post(format!("{}/peer/status", bootstrap_url_str))
                 .json(&RegisterReq { peer_id: state_check.local_peer_id.clone() })
                 .send().await {
-                if let Ok(status) = res.json::<StatusRes>().await {
-                    for from in status.unread_from {
+                if let Ok(res) = res.json::<StatusRes>().await {
+                    for from in res.unread_from {
                         state_check.emitter.emit(P2PEvent::PeerDiscovered { peer_id: from, nickname: "Offline ping".into() });
                     }
                 }
@@ -332,8 +343,8 @@ pub async fn run_p2p(
                 if let Ok(res) = client.post(format!("{}/qr/generate", bootstrap_url_str))
                     .json(&QrReq { peer_id: local_peer_id.clone(), validity_secs })
                     .send().await {
-                    if let Ok(qr) = res.json::<QrRes>().await {
-                        state.emitter.emit(P2PEvent::ListenAddress { content: qr.encrypted_token });
+                    if let Ok(qr_res) = res.json::<QrRes>().await {
+                        state.emitter.emit(P2PEvent::ListenAddress { content: qr_res.encrypted_token });
                     }
                 }
             }
@@ -343,22 +354,21 @@ pub async fn run_p2p(
                     .json(&ScanReq { scanner_peer_id: local_peer_id.clone(), encrypted_token: token })
                     .send().await {
                     Ok(res) => {
-                        if let Ok(scan_res) = res.json::<ScanRes>().await {
+                        if let Ok(scan_data) = res.json::<ScanRes>().await {
                             state.emitter.emit(P2PEvent::ScanResult { 
-                                success: scan_res.success, 
-                                message: scan_res.message,
-                                target_peer_id: scan_res.target_peer_id.clone(),
+                                success: scan_data.success, 
+                                message: scan_data.message,
+                                target_peer_id: scan_data.target_peer_id.clone(),
                             });
                             
                             // If successful, try to resolve IP immediately to speed up discovery
-                            if scan_res.success {
-                                if let Some(target_id) = scan_res.target_peer_id {
+                            if scan_data.success {
+                                if let Some(target_id) = scan_data.target_peer_id {
                                     let s = state.clone();
+                                    let c = client.clone();
                                     tokio::spawn(async move {
-                                        // Wait a bit for the server to propagate? 
-                                        // Actually the server linked them in the same request, so get_ip should work.
                                         let burl = s.bootstrap_url.lock().unwrap().clone();
-                                        if let Ok(ip_res) = reqwest::Client::new().post(format!("{}/peer/ip", burl))
+                                        if let Ok(ip_res) = c.post(format!("{}/peer/ip", burl))
                                             .json(&IpReq { requester_peer_id: s.local_peer_id.clone(), target_peer_id: target_id.clone() })
                                             .send().await {
                                             if let Ok(ip_data) = ip_res.json::<IpRes>().await {
@@ -422,19 +432,27 @@ fn scan_qr(token: String, state: State<'_, P2PHandle>) {
 #[tauri::command]
 async fn reset_identity(app: tauri::AppHandle) -> Result<(), String> {
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let id_path = app_dir.join("p2p_id_v3.txt");
-    let secret_path = app_dir.join("p2p_secret_v3.bin");
+    println!("Backend: RESET called. Cleaning dir: {:?}", app_dir);
+
+    let files_to_delete = vec![
+        "p2p_id_v3.txt",
+        "p2p_secret_v3.bin",
+        ".settings.dat", // This is the store file
+    ];
     
-    if id_path.exists() {
-        let _ = std::fs::remove_file(id_path);
-    }
-    if secret_path.exists() {
-        let _ = std::fs::remove_file(secret_path);
+    for f_name in files_to_delete {
+        let path = app_dir.join(f_name);
+        if path.exists() {
+            println!("Backend: Deleting {:?}", path);
+            let _ = std::fs::remove_file(path);
+        }
     }
     
-    // Also clear the store if possible? JS handles it but safe to do here if needed.
-    // However, the JS reload will wipe memory state anyway.
-    Ok(())
+    // Give some time for file system and UI to settle
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    
+    println!("Backend: Cleanup complete. Exiting app to enforce re-init.");
+    std::process::exit(0);
 }
 #[tauri::command]
 fn set_bootstrap_url(url: String, state: State<'_, P2PHandle>) {
@@ -465,6 +483,13 @@ pub fn run() {
             
             println!("Backend: App dir: {:?}", app_dir);
             let _ = std::fs::create_dir_all(&app_dir);
+
+            if key_path.exists() {
+                println!("Backend: FOUND legacy id file: {:?}", key_path);
+            }
+            if secret_path.exists() {
+                println!("Backend: FOUND secret key file: {:?}", secret_path);
+            }
 
             // 1. Load or generate secret bytes
             let mut secret_bytes = [0u8; 32];
