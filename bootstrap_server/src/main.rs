@@ -264,7 +264,26 @@ async fn main() {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    println!("Bootstrap server running on {}", addr);
+    println!("Bootstrap: HTTP Signaling listening on {}", addr);
+    
+    // Start UDP Echo Reflector on 3002 for connectivity tests
+    tokio::spawn(async move {
+        let socket = match tokio::net::UdpSocket::bind("0.0.0.0:3002").await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Bootstrap: Failed to bind UDP 3002: {}", e);
+                return;
+            }
+        };
+        println!("Bootstrap: UDP Echo Reflector listening on 0.0.0.0:3002");
+        let mut buf = [0u8; 1024];
+        loop {
+            if let Ok((n, addr)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(&buf[..n], addr).await;
+            }
+        }
+    });
+
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();

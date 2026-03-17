@@ -145,6 +145,32 @@ body {
     opacity: 0.8;
 }
 
+.network-status {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 3px 8px;
+    border-radius: var(--radius-pill);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.network-status .status-dot {
+    position: static;
+    width: 7px;
+    height: 7px;
+    border: none;
+}
+
+.status-dot.warning {
+    background: #ffcc00;
+    box-shadow: 0 0 8px rgba(255, 204, 0, 0.4);
+}
+
 /* header action buttons */
 .header-actions {
     display: flex;

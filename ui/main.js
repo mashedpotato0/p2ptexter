@@ -45,6 +45,8 @@ const backBtn = document.getElementById('back-btn');
 const appWrapper = document.getElementById('app-wrapper');
 const encIndicator = document.getElementById('enc-indicator');
 const searchInput = document.getElementById('search-input');
+const networkStatusDot = document.getElementById('network-status').querySelector('.status-dot');
+const networkStatusText = document.getElementById('network-status').querySelector('.status-text');
 
 // modals
 const nicknameModal = document.getElementById('nickname-modal');
@@ -103,6 +105,8 @@ async function init() {
             case 'SyncComplete': onSyncComplete(p.peer_id, p.count); break;
             case 'ListenAddress': renderQr(p.content); break; // content contains the QR token
             case 'ScanResult': onScanResult(p.success, p.message, p.target_peer_id); break;
+            case 'PortStatus': onPortStatus(p.success, p.message, p.details); break;
+            case 'BootstrapStatus': onBootstrapStatus(p.status); break;
             default: break;
         }
     });
@@ -191,6 +195,28 @@ function onScanResult(success, message, targetPeerId) {
         // alert('Success: ' + message); // maybe too annoying? keeping for now
     } else {
         alert('Scan failed: ' + message);
+    }
+}
+
+function onPortStatus(success, message, details) {
+    if (success) {
+        networkStatusDot.className = 'status-dot online';
+        networkStatusText.textContent = message;
+        document.getElementById('network-status').title = details || 'Connection is healthy';
+    } else {
+        networkStatusDot.className = 'status-dot warning';
+        networkStatusText.textContent = message || 'Port Blocked';
+        document.getElementById('network-status').title = details || 'UDP packets might be blocked by a firewall or ISP';
+        if (details) {
+            console.warn('Network issue:', details);
+        }
+    }
+}
+
+function onBootstrapStatus(status) {
+    console.log('main.js: bootstrap status', status);
+    if (!networkStatusText.textContent.includes('Mapped')) {
+        networkStatusText.textContent = status;
     }
 }
 

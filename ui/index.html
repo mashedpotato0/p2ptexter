@@ -26,7 +26,13 @@
                             alt="Me">
                     </div>
                     <div>
-                        <div class="nick-label" id="my-nickname">Anonymous</div>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <div class="nick-label" id="my-nickname">Anonymous</div>
+                            <div class="network-status" id="network-status" title="Network status">
+                                <span class="status-dot"></span>
+                                <span class="status-text">Connecting…</span>
+                            </div>
+                        </div>
                         <div class="peer-id-hash" id="my-peer-id">Connecting…</div>
                     </div>
                 </div>

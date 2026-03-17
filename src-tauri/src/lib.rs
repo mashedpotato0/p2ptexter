@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
+use std::net::{SocketAddr, SocketAddrV4};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use x25519_dalek::{PublicKey as X25519PublicKey, SharedSecret};
@@ -35,6 +36,7 @@ pub enum P2PEvent {
     KeyExchanged { peer_id: String, nickname: String },
     BootstrapStatus { status: String },
     ScanResult { success: bool, message: String, target_peer_id: Option<String> },
+    PortStatus { success: bool, message: String, details: Option<String> },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -141,22 +143,15 @@ fn derive_key(shared: &SharedSecret) -> [u8; 32] {
 
 // ── networking ───────────────────────────────────────────────────────────────
 
-async fn handle_connection(mut socket: TcpStream, state: Arc<AppState>) {
-    let peer_addr = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".into());
-    println!("Backend: Incoming P2P connection from {}", peer_addr);
-    let mut buf = vec![0u8; 4096];
-    match socket.read(&mut buf).await {
-        Ok(n) if n > 0 => {
-            if let Ok(env) = serde_json::from_slice::<Envelope>(&buf[..n]) {
-                process_envelope(env, state).await;
-            }
-        }
-        _ => {}
-    }
+async fn handle_punch(from: String, _state: Arc<AppState>) {
+    println!("Backend: Received direct UDP Punch from {}. NAT hole should be open.", from);
 }
 
 async fn process_envelope(env: Envelope, state: Arc<AppState>) {
     match env {
+        Envelope::Punch { from } => {
+            handle_punch(from, state).await;
+        }
         Envelope::Hello { from, pubkey, nickname } => {
             if from != state.local_peer_id {
                 if let Ok(pk_bytes) = B64.decode(pubkey) {
@@ -193,6 +188,23 @@ async fn process_envelope(env: Envelope, state: Arc<AppState>) {
     }
 }
 
+async fn punch_hole(to_peer_id: &str, state: Arc<AppState>) -> Result<(), Box<dyn Error>> {
+    let bootstrap_url = state.bootstrap_url.lock().unwrap().clone();
+    let client = reqwest::Client::new();
+    let res = client.post(format!("{}/peer/ip", bootstrap_url))
+        .json(&IpReq { requester_peer_id: state.local_peer_id.clone(), target_peer_id: to_peer_id.to_string() })
+        .send().await?;
+    
+    let ip_res: IpRes = res.json().await?;
+    if let Some(ip) = ip_res.ip {
+        let env = Envelope::Punch { from: state.local_peer_id.clone() };
+        let bytes = serde_json::to_vec(&env)?;
+        state.socket.send_to(&bytes, format!("{}:3001", ip)).await?;
+        println!("Backend: Sent direct UDP Punch to {}:3001", ip);
+    }
+    Ok(())
+}
+
 async fn send_direct_message(to_peer_id: &str, content: &str, state: Arc<AppState>) -> Result<(), Box<dyn Error>> {
     let bootstrap_url = state.bootstrap_url.lock().unwrap().clone();
     let client = reqwest::Client::new();
@@ -202,59 +214,183 @@ async fn send_direct_message(to_peer_id: &str, content: &str, state: Arc<AppStat
     
     let ip_res: IpRes = res.json().await?;
     if let Some(ip) = ip_res.ip {
-        println!("Backend: Resolved IP {} for peer {}. Attempting TCP connect...", ip, to_peer_id);
-        state.emitter.emit(P2PEvent::BootstrapStatus { status: format!("Connecting to {}:3001...", ip) });
+        println!("Backend: Resolved IP {} for peer {}. Sending via UDP...", ip, to_peer_id);
         
-        let mut stream = TcpStream::connect(format!("{}:3001", ip)).await?;
-        println!("Backend: Connected to peer {} at {}:3001!", to_peer_id, ip);
-        
+        // 1. Send Punch Request to Matchmaker (Bootstrap)
+        let _ = client.post(format!("{}/peer/punch", bootstrap_url))
+            .json(&PingReq { sender_peer_id: state.local_peer_id.clone(), target_peer_id: to_peer_id.to_string() })
+            .send().await;
+
         let key = state.peer_keys.lock().unwrap().get(to_peer_id).copied();
-        if let Some(k) = key {
+        let env = if let Some(k) = key {
             let (nonce, ciphertext) = encrypt(&k, content);
-            let env = Envelope::Msg {
+            Envelope::Msg {
                 from: state.local_peer_id.clone(),
                 to: to_peer_id.to_string(),
                 nonce,
                 ciphertext,
                 nickname: state.nickname.lock().unwrap().clone(),
                 ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
-            };
-            let bytes = serde_json::to_vec(&env)?;
-            stream.write_all(&bytes).await?;
-            Ok(())
+            }
         } else {
-            // Need to exchange keys first
-            let env = Envelope::Hello {
+            Envelope::Hello {
                 from: state.local_peer_id.clone(),
                 pubkey: state.local_pubkey_b64.clone(),
                 nickname: state.nickname.lock().unwrap().clone(),
-            };
-            let bytes = serde_json::to_vec(&env)?;
-            stream.write_all(&bytes).await?;
-            // Queue message and try again after key exchange? 
-            // Simplified: just fail here and let the UI handle it or queue it
+            }
+        };
+
+        let bytes = serde_json::to_vec(&env)?;
+        // Send multiple times for reliability in UDP hole punching
+        for _ in 0..3 {
+            state.socket.send_to(&bytes, format!("{}:3001", ip)).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        if key.is_none() {
             state.offline_queue.lock().unwrap().entry(to_peer_id.to_string()).or_default().push(QueuedMsg {
                 content: content.to_string(),
-                nickname: "".into(), // not used in queue
+                nickname: "".into(),
                 ts: 0,
             });
-            Err("Key not found, sent Hello instead".into())
+            return Err("Key not found, sent UDP Hello instead".into());
         }
+        Ok(())
     } else {
         println!("Backend: Peer {} is currently offline according to bootstrap.", to_peer_id);
         state.emitter.emit(P2PEvent::BootstrapStatus { status: format!("Peer {} is offline.", to_peer_id) });
-        // Peer offline, send ping to bootstrap
-        let bootstrap_url = state.bootstrap_url.lock().unwrap().clone();
-        client.post(format!("{}/peer/ping", bootstrap_url))
+        let _ = client.post(format!("{}/peer/ping", bootstrap_url))
             .json(&PingReq { sender_peer_id: state.local_peer_id.clone(), target_peer_id: to_peer_id.to_string() })
-            .send().await?;
+            .send().await;
         state.offline_queue.lock().unwrap().entry(to_peer_id.to_string()).or_default().push(QueuedMsg {
-            content: content.to_string(),
-            nickname: "".into(),
-            ts: 0,
+            content: content.to_string(), nickname: "".into(), ts: 0,
         });
         Err("Peer offline, pinged via bootstrap".into())
     }
+}
+
+// ── port forwarding ──────────────────────────────────────────────────────────
+
+async fn try_port_forward(state: Arc<AppState>) {
+    let local_ip = match local_ip_address::local_ip() {
+        Ok(std::net::IpAddr::V4(ip)) => ip,
+        _ => {
+            println!("Backend: Could not detect local IPv4 for port forwarding.");
+            return;
+        }
+    };
+    
+    let state_port = state.clone();
+    tokio::task::spawn_blocking(move || {
+        // 1. Try UPnP (Standard)
+        println!("Backend: Attempting UPnP mapping (sync) for port 3001 (UDP) to {}...", local_ip);
+        match igd_next::search_gateway(Default::default()) {
+            Ok(gateway) => {
+                let local_addr = SocketAddrV4::new(local_ip, 3001);
+                match gateway.add_port(
+                    igd_next::PortMappingProtocol::UDP,
+                    3001,
+                    SocketAddr::V4(local_addr),
+                    0,
+                    "P2PTexter",
+                ) {
+                    Ok(_) => {
+                        println!("Backend: UPnP Success! Port 3001 mapped.");
+                    state_port.emitter.emit(P2PEvent::PortStatus { 
+                        success: true, 
+                        message: "UPnP Mapped".into(),
+                        details: None
+                    });
+                    return;
+                    }
+                    Err(e) => println!("Backend: UPnP AddPort failed: {}", e),
+                }
+            }
+            Err(e) => println!("Backend: UPnP Gateway search failed: {}", e),
+        }
+
+        // 2. Try NAT-PMP (Apple/Modern)
+        println!("Backend: Trying NAT-PMP fallback...");
+        let mut n = match natpmp::Natpmp::new() {
+            Ok(n) => n,
+            Err(e) => {
+                println!("Backend: NAT-PMP init failed: {}", e);
+                return;
+            }
+        };
+        
+        if let Ok(_) = n.send_port_mapping_request(natpmp::Protocol::UDP, 3001, 3001, 3600) {
+            println!("Backend: NAT-PMP request sent.");
+            state_port.emitter.emit(P2PEvent::PortStatus { 
+                success: true, 
+                message: "NAT-PMP Requested".into(),
+                details: None
+            });
+        }
+    });
+}
+
+// ── connectivity diagnostics ──────────────────────────────────────────────────
+
+async fn perform_connectivity_test(state: Arc<AppState>) {
+    let bootstrap_url = state.bootstrap_url.lock().unwrap().clone();
+    // Parse IP from bootstrap URL (e.g. http://1.2.3.4:3000 -> 1.2.3.4)
+    let host = bootstrap_url.split("://").last().unwrap_or("").split(':').next().unwrap_or("");
+    if host.is_empty() { return; }
+
+    println!("Backend: Testing UDP connectivity via {}:3002...", host);
+    let test_msg = b"PING";
+    let _ = state.socket.send_to(test_msg, format!("{}:3002", host)).await;
+
+    // Listen for echo with timeout
+    let mut buf = [0u8; 1024];
+    let socket = state.socket.clone();
+    let timeout = tokio::time::timeout(std::time::Duration::from_secs(3), socket.recv_from(&mut buf)).await;
+
+    match timeout {
+        Ok(Ok((n, _addr))) if &buf[..n] == test_msg => {
+            println!("Backend: UDP Echo received! Port 3001 is reachable.");
+            state.emitter.emit(P2PEvent::PortStatus { 
+                success: true, 
+                message: "Internet Ready".into(),
+                details: Some("UDP Echo Success".into())
+            });
+        }
+        _ => {
+            println!("Backend: UDP Echo timeout. Port 3001 might be blocked.");
+            let mut details = "No Echo Response".to_string();
+            
+            #[cfg(target_os = "linux")]
+            if let Some(fw_msg) = check_linux_firewall() {
+                details = fw_msg;
+            }
+
+            state.emitter.emit(P2PEvent::PortStatus { 
+                success: false, 
+                message: "Port Blocked?".into(),
+                details: Some(details)
+            });
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_linux_firewall() -> Option<String> {
+    use std::process::Command;
+    // Check for ufw
+    if let Ok(output) = Command::new("ufw").arg("status").output() {
+        let status = String::from_utf8_lossy(&output.stdout);
+        if status.contains("active") && !status.contains("3001/udp") {
+            return Some("ufw active, allow 3001/udp".into());
+        }
+    }
+    // Check for firewalld
+    if let Ok(output) = Command::new("firewall-cmd").arg("--state").output() {
+        if String::from_utf8_lossy(&output.stdout).trim() == "running" {
+            return Some("firewalld active, allow 3001/udp".into());
+        }
+    }
+    None
 }
 
 // ── main loop ────────────────────────────────────────────────────────────────
@@ -268,6 +404,8 @@ pub async fn run_p2p(
     nickname: Arc<Mutex<String>>,
     bootstrap_url: Arc<Mutex<String>>,
 ) -> Result<(), Box<dyn Error>> {
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:3001").await?);
+    
     let state = Arc::new(AppState {
         local_peer_id: local_peer_id.clone(),
         local_pubkey_b64,
@@ -277,20 +415,30 @@ pub async fn run_p2p(
         nickname,
         bootstrap_url: bootstrap_url.clone(),
         emitter: Arc::new(TauriEmitter { handle: app_handle }),
+        socket,
     });
 
-    // Start TCP listener
-    let listener = TcpListener::bind("0.0.0.0:3001").await?;
-    let state_conn = state.clone();
+    // Start UDP inbound loop
+    let state_inbound = state.clone();
     tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
         loop {
-            if let Ok((socket, _)) = listener.accept().await {
-                let s = state_conn.clone();
-                tokio::spawn(async move {
-                    handle_connection(socket, s).await;
-                });
+            if let Ok((n, addr)) = state_inbound.socket.recv_from(&mut buf).await {
+                if let Ok(env) = serde_json::from_slice::<Envelope>(&buf[..n]) {
+                    println!("Backend: Received UDP envelope from {}", addr);
+                    process_envelope(env, state_inbound.clone()).await;
+                }
             }
         }
+    });
+
+    // Try Automated Port Forwarding (UPnP / NAT-PMP)
+    let state_diag = state.clone();
+    tokio::spawn(async move {
+        try_port_forward(state_diag.clone()).await;
+        // Wait a bit for mapping to settle, then test connectivity
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        perform_connectivity_test(state_diag).await;
     });
 
     let client = reqwest::Client::new();
@@ -313,7 +461,7 @@ pub async fn run_p2p(
 
     // Registration attempt immediately is handled by the first tick of the interval above
 
-    // Periodic status check
+    // Periodic status check (Pings + Punch Signals)
     let state_check = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -325,8 +473,14 @@ pub async fn run_p2p(
                 .json(&RegisterReq { peer_id: state_check.local_peer_id.clone() })
                 .send().await {
                 if let Ok(res) = res.json::<StatusRes>().await {
+                    // 1. Process offline notifications
                     for from in res.unread_from {
                         state_check.emitter.emit(P2PEvent::PeerDiscovered { peer_id: from, nickname: "Offline ping".into() });
+                    }
+                    // 2. Process punch requests (Matchmaking)
+                    for from_peer in res.punch_from {
+                        println!("Backend: Matchmaker says peer {} wants to connect. Punching...", from_peer);
+                        let _ = punch_hole(&from_peer, state_check.clone()).await;
                     }
                 }
             }
