@@ -34,7 +34,7 @@ pub enum P2PEvent {
     ListenAddress { content: String },
     KeyExchanged { peer_id: String, nickname: String },
     BootstrapStatus { status: String },
-    ScanResult { success: bool, message: String },
+    ScanResult { success: bool, message: String, target_peer_id: Option<String> },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -52,8 +52,13 @@ struct RegisterReq { peer_id: String }
 struct QrReq { peer_id: String, validity_secs: u64 }
 #[derive(Deserialize)]
 struct QrRes { encrypted_token: String }
-#[derive(Serialize)]
-struct ScanReq { scanner_peer_id: String, encrypted_token: String }
+#[derive(Deserialize)]
+struct ScanRes {
+    success: bool,
+    message: String,
+    target_peer_id: Option<String>,
+}
+
 #[derive(Serialize)]
 struct IpReq { requester_peer_id: String, target_peer_id: String }
 #[derive(Deserialize)]
@@ -276,18 +281,26 @@ pub async fn run_p2p(
         }
     });
 
-    // Register with bootstrap
-    let client = reqwest::Client::new();
-    let bootstrap_url_str = bootstrap_url.lock().unwrap().clone();
-    println!("Backend: Registering with bootstrap at {}", bootstrap_url_str);
-    let reg_res = client.post(format!("{}/register", bootstrap_url_str))
+    // Periodic registration with bootstrap
+    let state_reg = state.clone();
+    let local_peer_id_reg = local_peer_id.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let client = reqwest::Client::new();
+        loop {
+            interval.tick().await;
+            let bootstrap_url_str = state_reg.bootstrap_url.lock().unwrap().clone();
+            println!("Backend: Registering with bootstrap at {}", bootstrap_url_str);
+            let _ = client.post(format!("{}/register", bootstrap_url_str))
+                .json(&RegisterReq { peer_id: local_peer_id_reg.clone() })
+                .send().await;
+        }
+    });
+
+    // Registration attempt immediately (optional as interval.tick() fires immediately in some versions, but explicit is better)
+    let _ = client.post(format!("{}/register", bootstrap_url.lock().unwrap()))
         .json(&RegisterReq { peer_id: local_peer_id.clone() })
         .send().await;
-    
-    match reg_res {
-        Ok(_) => println!("Backend: Registration successful"),
-        Err(e) => eprintln!("Backend: Registration failed: {}", e),
-    }
 
     // Periodic status check
     let state_check = state.clone();
@@ -330,12 +343,39 @@ pub async fn run_p2p(
                     .json(&ScanReq { scanner_peer_id: local_peer_id.clone(), encrypted_token: token })
                     .send().await {
                     Ok(res) => {
-                        let success = res.status().is_success();
-                        let message = res.text().await.unwrap_or_else(|_| "Unknown error".into());
-                        state.emitter.emit(P2PEvent::ScanResult { success, message });
+                        if let Ok(scan_res) = res.json::<ScanRes>().await {
+                            state.emitter.emit(P2PEvent::ScanResult { 
+                                success: scan_res.success, 
+                                message: scan_res.message,
+                                target_peer_id: scan_res.target_peer_id.clone(),
+                            });
+                            
+                            // If successful, try to resolve IP immediately to speed up discovery
+                            if scan_res.success {
+                                if let Some(target_id) = scan_res.target_peer_id {
+                                    let s = state.clone();
+                                    tokio::spawn(async move {
+                                        // Wait a bit for the server to propagate? 
+                                        // Actually the server linked them in the same request, so get_ip should work.
+                                        let burl = s.bootstrap_url.lock().unwrap().clone();
+                                        if let Ok(ip_res) = reqwest::Client::new().post(format!("{}/peer/ip", burl))
+                                            .json(&IpReq { requester_peer_id: s.local_peer_id.clone(), target_peer_id: target_id.clone() })
+                                            .send().await {
+                                            if let Ok(ip_data) = ip_res.json::<IpRes>().await {
+                                                if let Some(_) = ip_data.ip {
+                                                    s.emitter.emit(P2PEvent::PeerDiscovered { peer_id: target_id, nickname: "".into() });
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        } else {
+                            state.emitter.emit(P2PEvent::ScanResult { success: false, message: "Decode error".into(), target_peer_id: None });
+                        }
                     }
                     Err(e) => {
-                        state.emitter.emit(P2PEvent::ScanResult { success: false, message: e.to_string() });
+                        state.emitter.emit(P2PEvent::ScanResult { success: false, message: e.to_string(), target_peer_id: None });
                     }
                 }
             }
@@ -382,10 +422,18 @@ fn scan_qr(token: String, state: State<'_, P2PHandle>) {
 #[tauri::command]
 async fn reset_identity(app: tauri::AppHandle) -> Result<(), String> {
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let key_path = app_dir.join("p2p_id_v3.txt");
-    if key_path.exists() {
-        std::fs::remove_file(key_path).map_err(|e| e.to_string())?;
+    let id_path = app_dir.join("p2p_id_v3.txt");
+    let secret_path = app_dir.join("p2p_secret_v3.bin");
+    
+    if id_path.exists() {
+        let _ = std::fs::remove_file(id_path);
     }
+    if secret_path.exists() {
+        let _ = std::fs::remove_file(secret_path);
+    }
+    
+    // Also clear the store if possible? JS handles it but safe to do here if needed.
+    // However, the JS reload will wipe memory state anyway.
     Ok(())
 }
 #[tauri::command]
@@ -400,21 +448,10 @@ fn set_bootstrap_url(url: String, state: State<'_, P2PHandle>) {
 pub fn run() {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<OutboundCmd>();
     
-    let mut secret_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut secret_bytes);
-    
-    let static_secret = x25519_dalek::StaticSecret::from(secret_bytes);
-    let local_pubkey_b64 = B64.encode(X25519PublicKey::from(&static_secret).as_bytes());
-
     let nickname = Arc::new(Mutex::new(String::new()));
     let peer_keys = Arc::new(Mutex::new(HashMap::new()));
-    
-    // Load bootstrap URL from store (handled in JS/Register)
     let bootstrap_url = Arc::new(Mutex::new("http://34.41.180.29:3000".to_string()));
     let bootstrap_url_loop = bootstrap_url.clone();
-
-    let local_peer_id_arc = Arc::new(Mutex::new(String::new()));
-    let local_peer_id_arc_setup = local_peer_id_arc.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::default().build())
@@ -424,23 +461,42 @@ pub fn run() {
             let app_handle = app.handle().clone();
             let app_dir = app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let key_path = app_dir.join("p2p_id_v3.txt");
+            let secret_path = app_dir.join("p2p_secret_v3.bin");
+            
             println!("Backend: App dir: {:?}", app_dir);
-            
-            let peer_id = if key_path.exists() {
-                std::fs::read_to_string(&key_path).unwrap_or_else(|_| String::new())
-            } else { String::new() };
+            let _ = std::fs::create_dir_all(&app_dir);
 
-            let peer_id = if peer_id.starts_with("peer_") {
-                peer_id
+            // 1. Load or generate secret bytes
+            let mut secret_bytes = [0u8; 32];
+            if secret_path.exists() {
+                if let Ok(bytes) = std::fs::read(&secret_path) {
+                    if bytes.len() == 32 {
+                        secret_bytes.copy_from_slice(&bytes);
+                        println!("Backend: Loaded existing secret key");
+                    } else {
+                        rand::thread_rng().fill_bytes(&mut secret_bytes);
+                        let _ = std::fs::write(&secret_path, &secret_bytes);
+                        println!("Backend: Corrupt secret key, generated new one");
+                    }
+                } else {
+                    rand::thread_rng().fill_bytes(&mut secret_bytes);
+                    let _ = std::fs::write(&secret_path, &secret_bytes);
+                    println!("Backend: Failed to read secret key, generated new one");
+                }
             } else {
-                let id = format!("peer_{}", &local_pubkey_b64[..12]);
-                let _ = std::fs::create_dir_all(&app_dir);
-                let _ = std::fs::write(&key_path, &id);
-                id
-            };
-            println!("Backend: Peer ID: {}", peer_id);
+                rand::thread_rng().fill_bytes(&mut secret_bytes);
+                let _ = std::fs::write(&secret_path, &secret_bytes);
+                println!("Backend: Generated and saved new secret key");
+            }
+
+            // 2. Derive public key and peer ID
+            let static_secret = x25519_dalek::StaticSecret::from(secret_bytes);
+            let local_pubkey_b64 = B64.encode(X25519PublicKey::from(&static_secret).as_bytes());
+            let peer_id = format!("peer_{}", &local_pubkey_b64[..12]);
             
-            *local_peer_id_arc_setup.lock().unwrap() = peer_id.clone();
+            // Save peer_id for reference (legacy compatibility)
+            let _ = std::fs::write(&key_path, &peer_id);
+            println!("Backend: Peer ID: {}", peer_id);
 
             app.manage(P2PHandle {
                 sender: cmd_tx,

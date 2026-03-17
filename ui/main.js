@@ -102,7 +102,7 @@ async function init() {
             case 'KeyExchanged': onKeyExchanged(p.peer_id, p.nickname); break;
             case 'SyncComplete': onSyncComplete(p.peer_id, p.count); break;
             case 'ListenAddress': renderQr(p.content); break; // content contains the QR token
-            case 'ScanResult': onScanResult(p.success, p.message); break;
+            case 'ScanResult': onScanResult(p.success, p.message, p.target_peer_id); break;
             default: break;
         }
     });
@@ -176,10 +176,19 @@ function applyNickname(name) {
     myNickEl.textContent = name;
 }
 
-function onScanResult(success, message) {
-    console.log('Scan result:', success, message);
+function onScanResult(success, message, targetPeerId) {
+    console.log('Scan result:', success, message, targetPeerId);
     if (success) {
-        alert('Success: ' + message);
+        if (targetPeerId) {
+            // we know who we just added - resolve them if not already online
+            onPeerDiscovered(targetPeerId, '');
+            const p = peers.get(targetPeerId);
+            if (p && p.status === 'connecting') {
+                p.lastMsg = 'linked successfully...';
+                renderContactsList();
+            }
+        }
+        // alert('Success: ' + message); // maybe too annoying? keeping for now
     } else {
         alert('Scan failed: ' + message);
     }
@@ -662,6 +671,7 @@ if (resetAppBtn) {
                 await store.clear();
                 await store.save();
                 await invoke('reset_identity');
+                alert("Identity reset. Please RESTART THE APP (close it and reopen) for the changes to take full effect.");
                 window.location.reload();
             } catch (e) {
                 console.error('reset failed', e);

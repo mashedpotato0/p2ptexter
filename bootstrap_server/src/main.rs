@@ -41,6 +41,13 @@ struct QrRes {
     encrypted_token: String,
 }
 
+#[derive(Serialize)]
+struct ScanRes {
+    success: bool,
+    message: String,
+    target_peer_id: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct ScanReq {
     scanner_peer_id: String,
@@ -127,7 +134,7 @@ async fn generate_qr(
 async fn scan_qr(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ScanReq>,
-) -> (StatusCode, &'static str) {
+) -> (StatusCode, Json<ScanRes>) {
     if let Some(decrypted) = decrypt_token(&state.secret_key, &payload.encrypted_token) {
         let parts: Vec<&str> = decrypted.split(':').collect();
         if parts.len() == 2 {
@@ -135,17 +142,29 @@ async fn scan_qr(
             let exp: u64 = parts[1].parse().unwrap_or(0);
             
             if now_secs() > exp {
-                return (StatusCode::BAD_REQUEST, "qr code expired");
+                return (StatusCode::BAD_REQUEST, Json(ScanRes {
+                    success: false,
+                    message: "qr code expired".into(),
+                    target_peer_id: None,
+                }));
             }
             
             let mut friends = state.friend_lists.lock().unwrap();
             friends.entry(payload.scanner_peer_id.clone()).or_default().insert(target_id.clone());
-            friends.entry(target_id).or_default().insert(payload.scanner_peer_id);
+            friends.entry(target_id.clone()).or_default().insert(payload.scanner_peer_id);
             
-            return (StatusCode::OK, "friends linked successfully");
+            return (StatusCode::OK, Json(ScanRes {
+                success: true,
+                message: "friends linked successfully".into(),
+                target_peer_id: Some(target_id),
+            }));
         }
     }
-    (StatusCode::BAD_REQUEST, "invalid token")
+    (StatusCode::BAD_REQUEST, Json(ScanRes {
+        success: false,
+        message: "invalid token".into(),
+        target_peer_id: None,
+    }))
 }
 
 // resolve friend ip

@@ -38,3 +38,8 @@ sha2 = "0.10"
 base64 = "0.22"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+[profile.release]
+codegen-units = 16
+panic = "abort"
+lto = "thin"
+strip = true # remove symbols to keep binary small
