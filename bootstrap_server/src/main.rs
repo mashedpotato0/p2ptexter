@@ -16,6 +16,13 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use libp2p::{
+    core::upgrade,
+    identify, kad, noise, relay, tcp, yamux,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    Multiaddr, PeerId, StreamProtocol,
+};
+use futures::StreamExt;
 
 // server state holding ephemeral connection data
 struct ServerState {
@@ -24,6 +31,14 @@ struct ServerState {
     offline_pings: Mutex<HashMap<String, HashSet<String>>>,
     punch_requests: Mutex<HashMap<String, HashSet<String>>>,
     secret_key: [u8; 32],
+    libp2p_info: Mutex<Option<(String, String)>>, // (PeerId, Multiaddr)
+}
+
+#[derive(NetworkBehaviour)]
+struct MyBehaviour {
+    relay: relay::Behaviour,
+    kad: kad::Behaviour<kad::store::MemoryStore>,
+    identify: identify::Behaviour,
 }
 
 #[derive(Deserialize)]
@@ -78,30 +93,14 @@ struct StatusRes {
     punch_from: Vec<String>,
 }
 
-// encrypt payload for qr code
-fn encrypt_token(key_bytes: &[u8; 32], payload: &str) -> String {
-    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
-    let cipher = Aes256Gcm::new(key);
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, payload.as_bytes()).unwrap();
-    format!("{}.{}", B64.encode(nonce_bytes), B64.encode(ciphertext))
+// encrypt payload for qr code// simplify: no encryption for now as requested
+fn encrypt_token(_key: &[u8; 32], payload: &str) -> String {
+    B64.encode(payload)
 }
 
-// decrypt qr payload
-fn decrypt_token(key_bytes: &[u8; 32], token: &str) -> Option<String> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
-    let cipher = Aes256Gcm::new(key);
-    let nonce_bytes = B64.decode(parts[0]).ok()?;
-    let ciphertext = B64.decode(parts[1]).ok()?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext.as_ref()).ok()?;
-    String::from_utf8(plaintext).ok()
+fn decrypt_token(_key: &[u8; 32], token: &str) -> Option<String> {
+    let decoded = B64.decode(token).ok()?;
+    String::from_utf8(decoded).ok()
 }
 
 // get current timestamp
@@ -116,18 +115,19 @@ async fn register_ip(
     Json(payload): Json<RegisterReq>,
 ) -> StatusCode {
     let ip = addr.ip().to_string();
-    println!("Registering peer {} with IP {}", payload.peer_id, ip);
+    println!("DEBUG: Registering peer {} with IP {}", payload.peer_id, ip);
     state.peer_ips.lock().unwrap().insert(payload.peer_id, ip);
     StatusCode::OK
 }
 
-// generate expiring encrypted qr token
+// generate expiring qr token (plain base64 for now)
 async fn generate_qr(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<QrReq>,
 ) -> Json<QrRes> {
     let exp = now_secs() + payload.validity_secs;
     let raw_token = format!("{}:{}", payload.peer_id, exp);
+    println!("DEBUG: Generating QR token for composite ID: {} (exp: {})", payload.peer_id, exp);
     let encrypted_token = encrypt_token(&state.secret_key, &raw_token);
     Json(QrRes { encrypted_token })
 }
@@ -137,13 +137,17 @@ async fn scan_qr(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ScanReq>,
 ) -> (StatusCode, Json<ScanRes>) {
+    println!("DEBUG: Scan attempt by {} with token {}", payload.scanner_peer_id, payload.encrypted_token);
     if let Some(decrypted) = decrypt_token(&state.secret_key, &payload.encrypted_token) {
-        let parts: Vec<&str> = decrypted.split(':').collect();
-        if parts.len() == 2 {
-            let target_id = parts[0].to_string();
-            let exp: u64 = parts[1].parse().unwrap_or(0);
+        println!("DEBUG: Decrypted internal token: {}", decrypted);
+        let mut parts: Vec<&str> = decrypted.split(':').collect();
+        if parts.len() >= 2 {
+            let exp_str = parts.pop().unwrap_or("0");
+            let target_id = parts.join(":");
+            let exp: u64 = exp_str.parse().unwrap_or(0);
             
             if now_secs() > exp {
+                println!("DEBUG: TOKEN EXPIRED for {}. Current: {}, Exp: {}", target_id, now_secs(), exp);
                 return (StatusCode::BAD_REQUEST, Json(ScanRes {
                     success: false,
                     message: "qr code expired".into(),
@@ -151,6 +155,7 @@ async fn scan_qr(
                 }));
             }
             
+            println!("DEBUG: LINKING FRIENDS: {} <-> {}", payload.scanner_peer_id, target_id);
             let mut friends = state.friend_lists.lock().unwrap();
             friends.entry(payload.scanner_peer_id.clone()).or_default().insert(target_id.clone());
             friends.entry(target_id.clone()).or_default().insert(payload.scanner_peer_id);
@@ -162,6 +167,7 @@ async fn scan_qr(
             }));
         }
     }
+    println!("DEBUG: FAILED scan from {}: Invalid or corrupt token", payload.scanner_peer_id);
     (StatusCode::BAD_REQUEST, Json(ScanRes {
         success: false,
         message: "invalid token".into(),
@@ -174,14 +180,17 @@ async fn get_ip(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<IpReq>,
 ) -> (StatusCode, Json<IpRes>) {
+    println!("DEBUG: IP lookup request from {} for {}", payload.requester_peer_id, payload.target_peer_id);
     let friends = state.friend_lists.lock().unwrap();
     if let Some(target_friends) = friends.get(&payload.target_peer_id) {
         if target_friends.contains(&payload.requester_peer_id) {
             let ips = state.peer_ips.lock().unwrap();
             let ip = ips.get(&payload.target_peer_id).cloned();
+            println!("DEBUG: IP found for {}: {:?}", payload.target_peer_id, ip);
             return (StatusCode::OK, Json(IpRes { ip }));
         }
     }
+    println!("DEBUG: IP lookup DENIED (not friends) for {} seeing {}", payload.requester_peer_id, payload.target_peer_id);
     (StatusCode::FORBIDDEN, Json(IpRes { ip: None }))
 }
 
@@ -205,30 +214,36 @@ async fn request_punch(
     StatusCode::OK
 }
 
-// retrieve and clear pending pings and punch requests for a peer
+// check status for pending notifications
 async fn check_status(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<RegisterReq>,
 ) -> Json<StatusRes> {
     let mut pings = state.offline_pings.lock().unwrap();
-    let unread = if let Some(pending) = pings.remove(&payload.peer_id) {
-        pending.into_iter().collect()
-    } else {
-        vec![]
-    };
-
     let mut punches = state.punch_requests.lock().unwrap();
-    let punch_reqs = if let Some(reqs) = punches.remove(&payload.peer_id) {
-        reqs.into_iter().collect()
-    } else {
-        vec![]
-    };
-
+    let unread = pings.remove(&payload.peer_id).map(|s| s.into_iter().collect()).unwrap_or_default();
+    let punch_reqs = punches.remove(&payload.peer_id).map(|s| s.into_iter().collect()).unwrap_or_default();
     Json(StatusRes { unread_from: unread, punch_from: punch_reqs })
 }
 
+#[derive(Serialize)]
+struct BootstrapInfo {
+    peer_id: String,
+    multiaddr: String,
+}
+
+async fn get_bootstrap_info(
+    State(state): State<Arc<ServerState>>,
+) -> Json<Option<BootstrapInfo>> {
+    let info = state.libp2p_info.lock().unwrap();
+    Json(info.as_ref().map(|(id, addr)| BootstrapInfo { 
+        peer_id: id.clone(), 
+        multiaddr: addr.clone() 
+    }))
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key_path = std::path::Path::new("secret.key");
     let mut secret_key = [0u8; 32];
     
@@ -251,6 +266,62 @@ async fn main() {
         offline_pings: Mutex::new(HashMap::new()),
         punch_requests: Mutex::new(HashMap::new()),
         secret_key,
+        libp2p_info: Mutex::new(None),
+    });
+
+    // --- libp2p Setup ---
+    let libp2p_keypair = libp2p::identity::Keypair::generate_ed25519();
+    let local_peer_id = libp2p_keypair.public().to_peer_id();
+    println!("Bootstrap: libp2p PeerId: {}", local_peer_id);
+
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(libp2p_keypair)
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_quic()
+        .with_behaviour(|key| {
+            let mut kad_cfg = kad::Config::default();
+            kad_cfg.set_protocol_names(vec![StreamProtocol::new("/p2ptexter/kad/1.0.0")]);
+            let store = kad::store::MemoryStore::new(key.public().to_peer_id());
+            
+            MyBehaviour {
+                relay: relay::Behaviour::new(key.public().to_peer_id(), relay::Config::default()),
+                kad: kad::Behaviour::with_config(key.public().to_peer_id(), store, kad_cfg),
+                identify: identify::Behaviour::new(identify::Config::new("/p2ptexter/1.0.0".into(), key.public())),
+            }
+        })?
+        .build();
+
+    swarm.listen_on("/ip4/0.0.0.0/tcp/4001".parse()?)?;
+    swarm.listen_on("/ip4/0.0.0.0/udp/4001/quic-v1".parse()?)?;
+
+    let state_p2p = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match swarm.next().await {
+                Some(SwarmEvent::NewListenAddr { address, .. }) => {
+                    if address.to_string().contains("127.0.0.1") || address.to_string().contains("::1") { continue; }
+                    println!("Bootstrap: libp2p listening on {}", address);
+                    let mut info = state_p2p.libp2p_info.lock().unwrap();
+                    if info.is_none() {
+                        *info = Some((local_peer_id.to_string(), address.to_string()));
+                    }
+                }
+                Some(SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }))) => {
+                    println!("Bootstrap: Identified peer {} with addrs {:?}", peer_id, info.listen_addrs);
+                    for addr in info.listen_addrs {
+                        swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                    }
+                }
+                Some(SwarmEvent::Behaviour(MyBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, .. }))) => {
+                    println!("Bootstrap: Kademlia routing updated for {}", peer);
+                }
+                _ => {}
+            }
+        }
     });
 
     let app = Router::new()
@@ -261,30 +332,14 @@ async fn main() {
         .route("/peer/ping", post(ping_offline))
         .route("/peer/punch", post(request_punch))
         .route("/peer/status", post(check_status))
-        .with_state(state);
+        .route("/bootstrap/info", post(get_bootstrap_info))
+        .with_state(state.clone());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Bootstrap: HTTP Signaling listening on {}", addr);
     
-    // Start UDP Echo Reflector on 3002 for connectivity tests
-    tokio::spawn(async move {
-        let socket = match tokio::net::UdpSocket::bind("0.0.0.0:3002").await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Bootstrap: Failed to bind UDP 3002: {}", e);
-                return;
-            }
-        };
-        println!("Bootstrap: UDP Echo Reflector listening on 0.0.0.0:3002");
-        let mut buf = [0u8; 1024];
-        loop {
-            if let Ok((n, addr)) = socket.recv_from(&mut buf).await {
-                let _ = socket.send_to(&buf[..n], addr).await;
-            }
-        }
-    });
-
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+    Ok(())
 }

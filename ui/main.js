@@ -206,8 +206,15 @@ function onPortStatus(success, message, details) {
     } else {
         networkStatusDot.className = 'status-dot warning';
         networkStatusText.textContent = message || 'Port Blocked';
-        document.getElementById('network-status').title = details || 'UDP packets might be blocked by a firewall or ISP';
-        if (details) {
+        
+        // Custom tooltips for clarity
+        let tooltip = details || 'UDP packets might be blocked by a firewall or ISP';
+        if (message === 'Mobile/NAT') {
+            tooltip = 'Mobile networks block inbound ports. Pure P2P will use Hole Punching to connect.';
+        }
+        
+        document.getElementById('network-status').title = tooltip;
+        if (details && message !== 'Mobile/NAT') {
             console.warn('Network issue:', details);
         }
     }
@@ -429,7 +436,7 @@ function selectChat(peerId) {
     chatStatusEl.textContent = p.status;
 
     updateEncIndicator(p.e2eReady, peerId);
-
+    invoke('set_active_peer', { peerId });
     renderContactsList();
     renderMessages();
     messageInput.focus();

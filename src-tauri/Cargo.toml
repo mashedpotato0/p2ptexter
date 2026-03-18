@@ -41,6 +41,8 @@ clap = { version = "4.5", features = ["derive"] }
 igd-next = { version = "0.14", features = ["aio_tokio"] }
 natpmp = "0.5"
 local-ip-address = "0.6"
+stun = "0.7"
+libp2p = { version = "0.53", features = ["tcp", "tls", "quic", "noise", "yamux", "relay", "dcutr", "kad", "identify", "autonat", "request-response", "cbor", "tokio", "macros"] }
 [profile.release]
 codegen-units = 16
 panic = "abort"

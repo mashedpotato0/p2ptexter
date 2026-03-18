@@ -5,15 +5,20 @@ use aes_gcm::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+// sha2 removed as it's no longer used
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
-use std::net::{SocketAddr, SocketAddrV4};
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use x25519_dalek::{PublicKey as X25519PublicKey, SharedSecret};
+use x25519_dalek::PublicKey as X25519PublicKey;
+use libp2p::{
+    core::upgrade,
+    dcutr, identify, kad, noise, relay, request_response, tcp, yamux,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    Multiaddr, PeerId, StreamProtocol, Transport,
+};
+use futures::StreamExt;
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -23,6 +28,7 @@ enum Envelope {
     Hello { from: String, pubkey: String, nickname: String },
     Msg { from: String, to: String, nonce: String, ciphertext: String, nickname: String, ts: u64 },
     Punch { from: String },
+    BootstrapInfo { peer_id: String, multiaddr: String }, // Added missing variant
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -64,14 +70,13 @@ struct ScanRes {
     target_peer_id: Option<String>,
 }
 
-#[derive(Serialize)]
-struct IpReq { requester_peer_id: String, target_peer_id: String }
-#[derive(Deserialize)]
-struct IpRes { ip: Option<String> }
-#[derive(Serialize)]
-struct PingReq { sender_peer_id: String, target_peer_id: String }
-#[derive(Deserialize)]
-struct StatusRes { unread_from: Vec<String>, punch_from: Vec<String> }
+// StatusRes removed as it's no longer used
+
+#[derive(Deserialize, Serialize, Clone)]
+struct BootstrapInfo {
+    peer_id: String,
+    multiaddr: String,
+}
 
 // ── shared state ─────────────────────────────────────────────────────────────
 
@@ -89,18 +94,30 @@ pub enum OutboundCmd {
     GenerateQr { validity_secs: u64 },
     ScanQr { token: String },
     SetNickname { name: String },
+    SetActivePeer { peer_id: Option<String> },
 }
 
 struct AppState {
     local_peer_id: String,
     local_pubkey_b64: String,
+    local_ed25519_pubkey_b64: String,
     local_secret_bytes: [u8; 32],
-    peer_keys: Arc<Mutex<HashMap<String, [u8; 32]>>>,
-    offline_queue: Arc<Mutex<HashMap<String, Vec<QueuedMsg>>>>,
+    peer_keys: Mutex<HashMap<String, [u8; 32]>>,
+    offline_queue: Mutex<HashMap<String, Vec<QueuedMsg>>>,
+    active_peer_id: Mutex<Option<String>>,
     nickname: Arc<Mutex<String>>,
     bootstrap_url: Arc<Mutex<String>>,
     emitter: Arc<TauriEmitter>,
-    socket: Arc<UdpSocket>,
+    libp2p_peer_id: PeerId,
+}
+
+#[derive(NetworkBehaviour)]
+struct AppBehaviour {
+    relay_client: relay::client::Behaviour,
+    dcutr: dcutr::Behaviour,
+    kad: kad::Behaviour<kad::store::MemoryStore>,
+    identify: identify::Behaviour,
+    request_response: request_response::cbor::Behaviour<Envelope, Envelope>, // 1:1 messaging
 }
 
 pub struct TauriEmitter {
@@ -113,287 +130,88 @@ impl TauriEmitter {
     }
 }
 
-// ── encryption ───────────────────────────────────────────────────────────────
+// ── networking ───────────────────────────────────────────────────────────────
 
-fn encrypt(key_bytes: &[u8; 32], plaintext: &str) -> (String, String) {
-    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
+// ── main loop ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn set_active_peer(peer_id: Option<String>, state: State<'_, P2PHandle>) -> Result<(), String> {
+    let _ = state.sender.send(OutboundCmd::SetActivePeer { peer_id });
+    Ok(())
+}
+
+// ── libp2p helpers ──────────────────────────────────────────────────────────
+
+fn get_libp2p_peer_id(b64_pubkey: &str) -> Option<PeerId> {
+    let bytes = B64.decode(b64_pubkey).ok()?;
+    let pubkey = libp2p::identity::ed25519::PublicKey::try_from_bytes(&bytes).ok()?;
+    Some(PeerId::from_public_key(&libp2p::identity::PublicKey::from(pubkey)))
+}
+
+fn encrypt_message_for_libp2p(to_peer_id: &str, content: &str, state: Arc<AppState>) -> Option<Envelope> {
+    let keys = state.peer_keys.lock().unwrap();
+    let target_pubkey_bytes = keys.get(to_peer_id)?;
+    let pubkey = X25519PublicKey::from(*target_pubkey_bytes);
+    let secret = x25519_dalek::StaticSecret::from(state.local_secret_bytes);
+    let shared = secret.diffie_hellman(&pubkey);
+    
+    let key = Key::<Aes256Gcm>::from_slice(shared.as_bytes());
     let cipher = Aes256Gcm::new(key);
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).expect("encryption failed");
-    (B64.encode(nonce_bytes), B64.encode(ciphertext))
-}
-
-fn decrypt(key_bytes: &[u8; 32], nonce_b64: &str, cipher_b64: &str) -> Option<String> {
-    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
-    let cipher = Aes256Gcm::new(key);
-    let nonce_bytes = B64.decode(nonce_b64).ok()?;
-    let ciphertext = B64.decode(cipher_b64).ok()?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext.as_ref()).ok()?;
-    String::from_utf8(plaintext).ok()
-}
-
-fn derive_key(shared: &SharedSecret) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(shared.as_bytes());
-    hasher.finalize().into()
-}
-
-// ── networking ───────────────────────────────────────────────────────────────
-
-async fn handle_punch(from: String, _state: Arc<AppState>) {
-    println!("Backend: Received direct UDP Punch from {}. NAT hole should be open.", from);
+    
+    let ciphertext = cipher.encrypt(nonce, content.as_bytes()).ok()?;
+    
+    Some(Envelope::Msg {
+        from: state.local_peer_id.clone(),
+        to: to_peer_id.to_string(),
+        nonce: B64.encode(nonce_bytes),
+        ciphertext: B64.encode(ciphertext),
+        nickname: state.nickname.lock().unwrap().clone(),
+        ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs(),
+    })
 }
 
 async fn process_envelope(env: Envelope, state: Arc<AppState>) {
     match env {
-        Envelope::Punch { from } => {
-            handle_punch(from, state).await;
-        }
         Envelope::Hello { from, pubkey, nickname } => {
-            if from != state.local_peer_id {
-                if let Ok(pk_bytes) = B64.decode(pubkey) {
-                    if pk_bytes.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&pk_bytes);
-                        let static_secret = x25519_dalek::StaticSecret::from(state.local_secret_bytes);
-                        let shared = static_secret.diffie_hellman(&X25519PublicKey::from(arr));
-                        let derived = derive_key(&shared);
-                        state.peer_keys.lock().unwrap().insert(from.clone(), derived);
-                        state.emitter.emit(P2PEvent::KeyExchanged { peer_id: from.clone(), nickname: nickname.clone() });
-                        
-                        // flush offline queue
-                        let to_send = state.offline_queue.lock().unwrap().remove(&from);
-                        if let Some(msgs) = to_send {
-                            for m in msgs {
-                                let _ = send_direct_message(&from, &m.content, state.clone()).await;
+            println!("Backend: Received Hello from {} ({})", nickname, from);
+            if let Ok(key_bytes) = B64.decode(pubkey) {
+                if key_bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&key_bytes);
+                    state.peer_keys.lock().unwrap().insert(from.clone(), arr);
+                    state.emitter.emit(P2PEvent::KeyExchanged { peer_id: from.clone(), nickname: nickname.clone() });
+                    state.emitter.emit(P2PEvent::PeerOnline { peer_id: from, nickname });
+                }
+            }
+        }
+        Envelope::Msg { from, nonce, ciphertext, nickname, .. } => {
+            println!("Backend: Received encrypted message from {}", nickname);
+            let keys = state.peer_keys.lock().unwrap();
+            if let Some(target_pubkey) = keys.get(&from) {
+                let pubkey = X25519PublicKey::from(*target_pubkey);
+                let secret = x25519_dalek::StaticSecret::from(state.local_secret_bytes);
+                let shared = secret.diffie_hellman(&pubkey);
+                
+                let key = Key::<Aes256Gcm>::from_slice(shared.as_bytes());
+                let cipher = Aes256Gcm::new(key);
+                
+                if let Ok(nonce_bytes) = B64.decode(nonce) {
+                    if let Ok(cipher_bytes) = B64.decode(ciphertext) {
+                        if let Ok(plaintext) = cipher.decrypt(Nonce::from_slice(&nonce_bytes), cipher_bytes.as_ref()) {
+                            if let Ok(content) = String::from_utf8(plaintext) {
+                                state.emitter.emit(P2PEvent::MessageReceived { peer_id: from, content, nickname });
                             }
                         }
                     }
                 }
             }
         }
-        Envelope::Msg { from, to, nonce, ciphertext, nickname, ts: _ } => {
-            if to == state.local_peer_id {
-                let key = state.peer_keys.lock().unwrap().get(&from).copied();
-                if let Some(k) = key {
-                    if let Some(plaintext) = decrypt(&k, &nonce, &ciphertext) {
-                        state.emitter.emit(P2PEvent::MessageReceived { peer_id: from, content: plaintext, nickname });
-                    }
-                }
-            }
-        }
+        _ => {}
     }
 }
-
-async fn punch_hole(to_peer_id: &str, state: Arc<AppState>) -> Result<(), Box<dyn Error>> {
-    let bootstrap_url = state.bootstrap_url.lock().unwrap().clone();
-    let client = reqwest::Client::new();
-    let res = client.post(format!("{}/peer/ip", bootstrap_url))
-        .json(&IpReq { requester_peer_id: state.local_peer_id.clone(), target_peer_id: to_peer_id.to_string() })
-        .send().await?;
-    
-    let ip_res: IpRes = res.json().await?;
-    if let Some(ip) = ip_res.ip {
-        let env = Envelope::Punch { from: state.local_peer_id.clone() };
-        let bytes = serde_json::to_vec(&env)?;
-        state.socket.send_to(&bytes, format!("{}:3001", ip)).await?;
-        println!("Backend: Sent direct UDP Punch to {}:3001", ip);
-    }
-    Ok(())
-}
-
-async fn send_direct_message(to_peer_id: &str, content: &str, state: Arc<AppState>) -> Result<(), Box<dyn Error>> {
-    let bootstrap_url = state.bootstrap_url.lock().unwrap().clone();
-    let client = reqwest::Client::new();
-    let res = client.post(format!("{}/peer/ip", bootstrap_url))
-        .json(&IpReq { requester_peer_id: state.local_peer_id.clone(), target_peer_id: to_peer_id.to_string() })
-        .send().await?;
-    
-    let ip_res: IpRes = res.json().await?;
-    if let Some(ip) = ip_res.ip {
-        println!("Backend: Resolved IP {} for peer {}. Sending via UDP...", ip, to_peer_id);
-        
-        // 1. Send Punch Request to Matchmaker (Bootstrap)
-        let _ = client.post(format!("{}/peer/punch", bootstrap_url))
-            .json(&PingReq { sender_peer_id: state.local_peer_id.clone(), target_peer_id: to_peer_id.to_string() })
-            .send().await;
-
-        let key = state.peer_keys.lock().unwrap().get(to_peer_id).copied();
-        let env = if let Some(k) = key {
-            let (nonce, ciphertext) = encrypt(&k, content);
-            Envelope::Msg {
-                from: state.local_peer_id.clone(),
-                to: to_peer_id.to_string(),
-                nonce,
-                ciphertext,
-                nickname: state.nickname.lock().unwrap().clone(),
-                ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
-            }
-        } else {
-            Envelope::Hello {
-                from: state.local_peer_id.clone(),
-                pubkey: state.local_pubkey_b64.clone(),
-                nickname: state.nickname.lock().unwrap().clone(),
-            }
-        };
-
-        let bytes = serde_json::to_vec(&env)?;
-        // Send multiple times for reliability in UDP hole punching
-        for _ in 0..3 {
-            state.socket.send_to(&bytes, format!("{}:3001", ip)).await?;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        if key.is_none() {
-            state.offline_queue.lock().unwrap().entry(to_peer_id.to_string()).or_default().push(QueuedMsg {
-                content: content.to_string(),
-                nickname: "".into(),
-                ts: 0,
-            });
-            return Err("Key not found, sent UDP Hello instead".into());
-        }
-        Ok(())
-    } else {
-        println!("Backend: Peer {} is currently offline according to bootstrap.", to_peer_id);
-        state.emitter.emit(P2PEvent::BootstrapStatus { status: format!("Peer {} is offline.", to_peer_id) });
-        let _ = client.post(format!("{}/peer/ping", bootstrap_url))
-            .json(&PingReq { sender_peer_id: state.local_peer_id.clone(), target_peer_id: to_peer_id.to_string() })
-            .send().await;
-        state.offline_queue.lock().unwrap().entry(to_peer_id.to_string()).or_default().push(QueuedMsg {
-            content: content.to_string(), nickname: "".into(), ts: 0,
-        });
-        Err("Peer offline, pinged via bootstrap".into())
-    }
-}
-
-// ── port forwarding ──────────────────────────────────────────────────────────
-
-async fn try_port_forward(state: Arc<AppState>) {
-    let local_ip = match local_ip_address::local_ip() {
-        Ok(std::net::IpAddr::V4(ip)) => ip,
-        _ => {
-            println!("Backend: Could not detect local IPv4 for port forwarding.");
-            return;
-        }
-    };
-    
-    let state_port = state.clone();
-    tokio::task::spawn_blocking(move || {
-        // 1. Try UPnP (Standard)
-        println!("Backend: Attempting UPnP mapping (sync) for port 3001 (UDP) to {}...", local_ip);
-        match igd_next::search_gateway(Default::default()) {
-            Ok(gateway) => {
-                let local_addr = SocketAddrV4::new(local_ip, 3001);
-                match gateway.add_port(
-                    igd_next::PortMappingProtocol::UDP,
-                    3001,
-                    SocketAddr::V4(local_addr),
-                    0,
-                    "P2PTexter",
-                ) {
-                    Ok(_) => {
-                        println!("Backend: UPnP Success! Port 3001 mapped.");
-                    state_port.emitter.emit(P2PEvent::PortStatus { 
-                        success: true, 
-                        message: "UPnP Mapped".into(),
-                        details: None
-                    });
-                    return;
-                    }
-                    Err(e) => println!("Backend: UPnP AddPort failed: {}", e),
-                }
-            }
-            Err(e) => println!("Backend: UPnP Gateway search failed: {}", e),
-        }
-
-        // 2. Try NAT-PMP (Apple/Modern)
-        println!("Backend: Trying NAT-PMP fallback...");
-        let mut n = match natpmp::Natpmp::new() {
-            Ok(n) => n,
-            Err(e) => {
-                println!("Backend: NAT-PMP init failed: {}", e);
-                return;
-            }
-        };
-        
-        if let Ok(_) = n.send_port_mapping_request(natpmp::Protocol::UDP, 3001, 3001, 3600) {
-            println!("Backend: NAT-PMP request sent.");
-            state_port.emitter.emit(P2PEvent::PortStatus { 
-                success: true, 
-                message: "NAT-PMP Requested".into(),
-                details: None
-            });
-        }
-    });
-}
-
-// ── connectivity diagnostics ──────────────────────────────────────────────────
-
-async fn perform_connectivity_test(state: Arc<AppState>) {
-    let bootstrap_url = state.bootstrap_url.lock().unwrap().clone();
-    // Parse IP from bootstrap URL (e.g. http://1.2.3.4:3000 -> 1.2.3.4)
-    let host = bootstrap_url.split("://").last().unwrap_or("").split(':').next().unwrap_or("");
-    if host.is_empty() { return; }
-
-    println!("Backend: Testing UDP connectivity via {}:3002...", host);
-    let test_msg = b"PING";
-    let _ = state.socket.send_to(test_msg, format!("{}:3002", host)).await;
-
-    // Listen for echo with timeout
-    let mut buf = [0u8; 1024];
-    let socket = state.socket.clone();
-    let timeout = tokio::time::timeout(std::time::Duration::from_secs(3), socket.recv_from(&mut buf)).await;
-
-    match timeout {
-        Ok(Ok((n, _addr))) if &buf[..n] == test_msg => {
-            println!("Backend: UDP Echo received! Port 3001 is reachable.");
-            state.emitter.emit(P2PEvent::PortStatus { 
-                success: true, 
-                message: "Internet Ready".into(),
-                details: Some("UDP Echo Success".into())
-            });
-        }
-        _ => {
-            println!("Backend: UDP Echo timeout. Port 3001 might be blocked.");
-            let mut details = "No Echo Response".to_string();
-            
-            #[cfg(target_os = "linux")]
-            if let Some(fw_msg) = check_linux_firewall() {
-                details = fw_msg;
-            }
-
-            state.emitter.emit(P2PEvent::PortStatus { 
-                success: false, 
-                message: "Port Blocked?".into(),
-                details: Some(details)
-            });
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn check_linux_firewall() -> Option<String> {
-    use std::process::Command;
-    // Check for ufw
-    if let Ok(output) = Command::new("ufw").arg("status").output() {
-        let status = String::from_utf8_lossy(&output.stdout);
-        if status.contains("active") && !status.contains("3001/udp") {
-            return Some("ufw active, allow 3001/udp".into());
-        }
-    }
-    // Check for firewalld
-    if let Ok(output) = Command::new("firewall-cmd").arg("--state").output() {
-        if String::from_utf8_lossy(&output.stdout).trim() == "running" {
-            return Some("firewalld active, allow 3001/udp".into());
-        }
-    }
-    None
-}
-
-// ── main loop ────────────────────────────────────────────────────────────────
 
 pub async fn run_p2p(
     app_handle: tauri::AppHandle,
@@ -404,151 +222,163 @@ pub async fn run_p2p(
     nickname: Arc<Mutex<String>>,
     bootstrap_url: Arc<Mutex<String>>,
 ) -> Result<(), Box<dyn Error>> {
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:3001").await?);
-    
+    let mut secret_bytes_mut = secret_bytes;
+    let libp2p_keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut secret_bytes_mut).unwrap();
+    let libp2p_peer_id = libp2p_keypair.public().to_peer_id();
+    println!("Backend: libp2p PeerId: {}", libp2p_peer_id);
+
+    let (relay_transport, relay_client) = relay::client::new(libp2p_peer_id);
+
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(libp2p_keypair.clone())
+        .with_tokio()
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        .with_quic()
+        .with_other_transport(|key| relay_transport.upgrade(upgrade::Version::V1).authenticate(noise::Config::new(key).unwrap()).multiplex(yamux::Config::default()))?
+        .with_behaviour(|key: &libp2p::identity::Keypair| {
+            let mut kad_cfg = kad::Config::default();
+            kad_cfg.set_protocol_names(vec![StreamProtocol::new("/p2ptexter/kad/1.0.0")]);
+            let store = kad::store::MemoryStore::new(key.public().to_peer_id());
+            AppBehaviour {
+                relay_client,
+                dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
+                kad: kad::Behaviour::with_config(key.public().to_peer_id(), store, kad_cfg),
+                identify: identify::Behaviour::new(identify::Config::new("/p2ptexter/1.0.0".into(), key.public())),
+                request_response: request_response::cbor::Behaviour::new(
+                    [(StreamProtocol::new("/p2ptexter/msg/1.0.0"), request_response::ProtocolSupport::Full)],
+                    request_response::Config::default()
+                ),
+            }
+        })?
+        .build();
+
+    let ed25519_pubkey_b64 = B64.encode(libp2p_keypair.public().try_into_ed25519().unwrap().to_bytes());
+
     let state = Arc::new(AppState {
         local_peer_id: local_peer_id.clone(),
         local_pubkey_b64,
+        local_ed25519_pubkey_b64: ed25519_pubkey_b64,
         local_secret_bytes: secret_bytes,
-        peer_keys: Arc::new(Mutex::new(HashMap::new())),
-        offline_queue: Arc::new(Mutex::new(HashMap::new())),
+        peer_keys: Mutex::new(HashMap::new()),
+        offline_queue: Mutex::new(HashMap::new()),
+        active_peer_id: Mutex::new(None),
         nickname,
         bootstrap_url: bootstrap_url.clone(),
-        emitter: Arc::new(TauriEmitter { handle: app_handle }),
-        socket,
+        emitter: Arc::new(TauriEmitter { handle: app_handle.clone() }),
+        libp2p_peer_id,
     });
 
-    // Start UDP inbound loop
-    let state_inbound = state.clone();
-    tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
-        loop {
-            if let Ok((n, addr)) = state_inbound.socket.recv_from(&mut buf).await {
-                if let Ok(env) = serde_json::from_slice::<Envelope>(&buf[..n]) {
-                    println!("Backend: Received UDP envelope from {}", addr);
-                    process_envelope(env, state_inbound.clone()).await;
-                }
-            }
-        }
-    });
-
-    // Try Automated Port Forwarding (UPnP / NAT-PMP)
-    let state_diag = state.clone();
-    tokio::spawn(async move {
-        try_port_forward(state_diag.clone()).await;
-        // Wait a bit for mapping to settle, then test connectivity
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        perform_connectivity_test(state_diag).await;
-    });
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
 
     let client = reqwest::Client::new();
+    let mut bootstrap_info: Option<BootstrapInfo> = None;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
 
-    // Periodic registration with bootstrap
-    let state_reg = state.clone();
-    let local_peer_id_reg = local_peer_id.clone();
-    let client_reg = client.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            let bootstrap_url_str = state_reg.bootstrap_url.lock().unwrap().clone();
-            println!("Backend: Registering with bootstrap at {}", bootstrap_url_str);
-            let _ = client_reg.post(format!("{}/register", bootstrap_url_str))
-                .json(&RegisterReq { peer_id: local_peer_id_reg.clone() })
-                .send().await;
-        }
-    });
-
-    // Registration attempt immediately is handled by the first tick of the interval above
-
-    // Periodic status check (Pings + Punch Signals)
-    let state_check = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        let c = reqwest::Client::new();
-        loop {
-            interval.tick().await;
-            let bootstrap_url_str = state_check.bootstrap_url.lock().unwrap().clone();
-            if let Ok(res) = c.post(format!("{}/peer/status", bootstrap_url_str))
-                .json(&RegisterReq { peer_id: state_check.local_peer_id.clone() })
-                .send().await {
-                if let Ok(res) = res.json::<StatusRes>().await {
-                    // 1. Process offline notifications
-                    for from in res.unread_from {
-                        state_check.emitter.emit(P2PEvent::PeerDiscovered { peer_id: from, nickname: "Offline ping".into() });
-                    }
-                    // 2. Process punch requests (Matchmaking)
-                    for from_peer in res.punch_from {
-                        println!("Backend: Matchmaker says peer {} wants to connect. Punching...", from_peer);
-                        let _ = punch_hole(&from_peer, state_check.clone()).await;
+    loop {
+        tokio::select! {
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    println!("Backend: Listening on {}", address);
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { .. })) => {
+                    println!("Backend: Relay reservation accepted!");
+                    state.emitter.emit(P2PEvent::PortStatus { success: true, message: "Bridged (Relay/DCUtR)".into(), details: Some("Hole punching active".into()) });
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, peer_id, .. })) => {
+                    for addr in info.listen_addrs {
+                        swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                     }
                 }
-            }
-        }
-    });
-
-    while let Some(cmd) = cmd_rx.recv().await {
-        match cmd {
-            OutboundCmd::SendMsg { to, content } => {
-                let _ = send_direct_message(&to, &content, state.clone()).await;
-            }
-            OutboundCmd::GenerateQr { validity_secs } => {
-                let bootstrap_url_str = bootstrap_url.lock().unwrap().clone();
-                if let Ok(res) = client.post(format!("{}/qr/generate", bootstrap_url_str))
-                    .json(&QrReq { peer_id: local_peer_id.clone(), validity_secs })
-                    .send().await {
-                    if let Ok(qr_res) = res.json::<QrRes>().await {
-                        state.emitter.emit(P2PEvent::ListenAddress { content: qr_res.encrypted_token });
+                SwarmEvent::Behaviour(AppBehaviourEvent::RequestResponse(request_response::Event::Message { message, .. })) => {
+                    if let request_response::Message::Request { request, channel, .. } = message {
+                        process_envelope(request, state.clone()).await;
+                        let _ = swarm.behaviour_mut().request_response.send_response(channel, Envelope::Punch { from: local_peer_id.clone() });
                     }
                 }
-            }
-            OutboundCmd::ScanQr { token } => {
-                let bootstrap_url_str = bootstrap_url.lock().unwrap().clone();
-                match client.post(format!("{}/qr/scan", bootstrap_url_str))
-                    .json(&ScanReq { scanner_peer_id: local_peer_id.clone(), encrypted_token: token })
-                    .send().await {
-                    Ok(res) => {
-                        if let Ok(scan_data) = res.json::<ScanRes>().await {
-                            state.emitter.emit(P2PEvent::ScanResult { 
-                                success: scan_data.success, 
-                                message: scan_data.message,
-                                target_peer_id: scan_data.target_peer_id.clone(),
-                            });
-                            
-                            // If successful, try to resolve IP immediately to speed up discovery
-                            if scan_data.success {
-                                if let Some(target_id) = scan_data.target_peer_id {
-                                    let s = state.clone();
-                                    let c = client.clone();
-                                    tokio::spawn(async move {
-                                        let burl = s.bootstrap_url.lock().unwrap().clone();
-                                        if let Ok(ip_res) = c.post(format!("{}/peer/ip", burl))
-                                            .json(&IpReq { requester_peer_id: s.local_peer_id.clone(), target_peer_id: target_id.clone() })
-                                            .send().await {
-                                            if let Ok(ip_data) = ip_res.json::<IpRes>().await {
-                                                if let Some(_) = ip_data.ip {
-                                                    s.emitter.emit(P2PEvent::PeerDiscovered { peer_id: target_id, nickname: "".into() });
+                SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(_)) => {
+                    // Hole punching is managed internally; UI notification skipped for now due to type ambiguity
+                }
+                _ => {}
+            },
+            cmd = cmd_rx.recv() => if let Some(cmd) = cmd {
+                match cmd {
+                    OutboundCmd::SendMsg { to, content } => {
+                        let mut target_pid: Option<PeerId> = None;
+                        {
+                            let keys = state.peer_keys.lock().unwrap();
+                            if let Some(pk) = keys.get(&to) {
+                                target_pid = get_libp2p_peer_id(&B64.encode(pk));
+                            }
+                        }
+                        if let Some(pid) = target_pid {
+                            if let Some(env) = encrypt_message_for_libp2p(&to, &content, state.clone()) {
+                                swarm.behaviour_mut().request_response.send_request(&pid, env);
+                            }
+                        }
+                    }
+                    OutboundCmd::GenerateQr { validity_secs } => {
+                        let burl = state.bootstrap_url.lock().unwrap().clone();
+                        let composite_id = format!("{}:{}", state.local_pubkey_b64, state.local_ed25519_pubkey_b64);
+                        if let Ok(res) = client.post(format!("{}/qr/generate", burl)).json(&QrReq { peer_id: composite_id, validity_secs }).send().await {
+                            if let Ok(qr) = res.json::<QrRes>().await {
+                                state.emitter.emit(P2PEvent::ListenAddress { content: qr.encrypted_token });
+                            }
+                        }
+                    }
+                    OutboundCmd::ScanQr { token } => {
+                        let burl = state.bootstrap_url.lock().unwrap().clone();
+                        if let Ok(res) = client.post(format!("{}/qr/scan", burl)).json(&ScanReq { scanner_peer_id: state.local_peer_id.clone(), encrypted_token: token }).send().await {
+                            if let Ok(scan) = res.json::<ScanRes>().await {
+                                if scan.success {
+                                    if let Some(composite) = scan.target_peer_id.clone() {
+                                        let parts: Vec<&str> = composite.split(':').collect();
+                                        if parts.len() == 2 {
+                                            let x25519_pub = parts[0];
+                                            let ed25519_pub = parts[1];
+                                            if let Ok(key_bytes) = B64.decode(x25519_pub) {
+                                                if key_bytes.len() == 32 {
+                                                    let mut arr = [0u8; 32];
+                                                    arr.copy_from_slice(&key_bytes);
+                                                    let short_id = format!("peer_{}", &x25519_pub[..12]);
+                                                    state.peer_keys.lock().unwrap().insert(short_id.clone(), arr);
+                                                    
+                                                    if let Some(pid) = get_libp2p_peer_id(ed25519_pub) {
+                                                        swarm.behaviour_mut().kad.get_closest_peers(pid);
+                                                    }
                                                 }
                                             }
                                         }
-                                    });
+                                    }
                                 }
+                                state.emitter.emit(P2PEvent::ScanResult { success: scan.success, message: scan.message, target_peer_id: scan.target_peer_id });
                             }
-                        } else {
-                            state.emitter.emit(P2PEvent::ScanResult { success: false, message: "Decode error".into(), target_peer_id: None });
                         }
                     }
-                    Err(e) => {
-                        state.emitter.emit(P2PEvent::ScanResult { success: false, message: e.to_string(), target_peer_id: None });
+                    OutboundCmd::SetActivePeer { peer_id } => {
+                        *state.active_peer_id.lock().unwrap() = peer_id;
+                    }
+                    OutboundCmd::SetNickname { name: _ } => {}
+                }
+            },
+            _ = tick.tick() => {
+                let burl = state.bootstrap_url.lock().unwrap().clone();
+                if bootstrap_info.is_none() {
+                    if let Ok(res) = client.post(format!("{}/bootstrap/info", burl)).send().await {
+                        if let Ok(info_opt) = res.json::<Option<BootstrapInfo>>().await {
+                            if let Some(info) = info_opt {
+                                if let (Ok(pid), Ok(addr)) = (info.peer_id.parse::<PeerId>(), info.multiaddr.parse::<Multiaddr>()) {
+                                    swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+                                    let _ = swarm.dial(addr.with(libp2p::multiaddr::Protocol::P2p(pid)));
+                                    bootstrap_info = Some(info);
+                                }
+                            }
+                        }
                     }
                 }
-            }
-            OutboundCmd::SetNickname { name } => {
-                *state.nickname.lock().unwrap() = name;
+                let _ = client.post(format!("{}/register", burl)).json(&RegisterReq { peer_id: state.local_peer_id.clone() }).send().await;
             }
         }
     }
-    Ok(())
 }
 
 // ── tauri commands ────────────────────────────────────────────────────────────
@@ -705,6 +535,7 @@ pub fn run() {
             scan_qr,
             reset_identity,
             set_bootstrap_url,
+            set_active_peer,
         ])
         .run(tauri::generate_context!())
         .expect("error running app");
