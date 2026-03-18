@@ -155,10 +155,17 @@ async fn scan_qr(
                 }));
             }
             
-            println!("DEBUG: LINKING FRIENDS: {} <-> {}", payload.scanner_peer_id, target_id);
+            let target_short_id = if target_id.contains(':') {
+                let parts: Vec<&str> = target_id.split(':').collect();
+                format!("peer_{}", &parts[0].get(..12).unwrap_or(parts[0]))
+            } else {
+                target_id.clone()
+            };
+
+            println!("DEBUG: LINKING FRIENDS: {} <-> {} (raw: {})", payload.scanner_peer_id, target_short_id, target_id);
             let mut friends = state.friend_lists.lock().unwrap();
-            friends.entry(payload.scanner_peer_id.clone()).or_default().insert(target_id.clone());
-            friends.entry(target_id.clone()).or_default().insert(payload.scanner_peer_id);
+            friends.entry(payload.scanner_peer_id.clone()).or_default().insert(target_short_id.clone());
+            friends.entry(target_short_id).or_default().insert(payload.scanner_peer_id);
             
             return (StatusCode::OK, Json(ScanRes {
                 success: true,

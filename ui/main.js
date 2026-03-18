@@ -187,12 +187,12 @@ function onScanResult(success, message, targetPeerId) {
             // we know who we just added - resolve them if not already online
             onPeerDiscovered(targetPeerId, '');
             const p = peers.get(targetPeerId);
-            if (p && p.status === 'connecting') {
+            if (p && (p.status === 'connecting' || p.status === 'offline')) {
                 p.lastMsg = 'linked successfully...';
                 renderContactsList();
             }
+            selectChat(targetPeerId);
         }
-        // alert('Success: ' + message); // maybe too annoying? keeping for now
     } else {
         alert('Scan failed: ' + message);
     }
@@ -529,43 +529,21 @@ confirmAddFriend.onclick = async () => {
         // extract peer id from multiaddr
         const parts = input.split('/p2p/');
         id = parts[parts.length - 1];
+        onPeerDiscovered(id, '');
+        selectChat(id);
+    } else if (input.startsWith('peer_')) {
+        onPeerDiscovered(id, '');
+        selectChat(id);
     }
 
-    // add to local contacts immediately with a connecting status
-    onPeerDiscovered(id, '');
-    const p = peers.get(id);
-    if (p) {
-        p.status = 'connecting';
-        p.lastMsg = 'searching via internet...';
-        
-        // set 30s timeout for "connecting" state
-        if (p.connTimeout) clearTimeout(p.connTimeout);
-        p.connTimeout = setTimeout(() => {
-            const peer = peers.get(id);
-            if (peer && peer.status === 'connecting') {
-                peer.status = 'offline';
-                peer.lastMsg = 'peer not found / offline';
-                renderContactsList();
-                if (activePeerId === id) chatStatusEl.textContent = 'offline';
-                saveState();
-            }
-        }, 30000);
-        
-        peers.set(id, p);
-    }
+    // if it's not a known peer ID or multiaddr, we treat it as a token and just scan it
     addFriendModal.classList.add('hidden');
-    selectChat(id);
 
     // tell the backend to initiate scan or fallback
     try {
         await invoke('scan_qr', { token: input });
     } catch (e) {
         console.error('scan failed', e);
-        if (p) {
-            p.status = 'offline';
-            p.lastMsg = 'scan failed: ' + e;
-            renderContactsList();
-        }
     }
     saveState();
 };

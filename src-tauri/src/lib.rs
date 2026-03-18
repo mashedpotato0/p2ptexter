@@ -63,6 +63,11 @@ struct QrRes { encrypted_token: String }
 #[derive(Serialize)]
 struct ScanReq { scanner_peer_id: String, encrypted_token: String }
 
+#[derive(Serialize)]
+struct IpReq { requester_peer_id: String, target_peer_id: String }
+#[derive(Deserialize)]
+struct IpRes { ip: Option<String> }
+
 #[derive(Deserialize)]
 struct ScanRes {
     success: bool,
@@ -95,6 +100,7 @@ pub enum OutboundCmd {
     ScanQr { token: String },
     SetNickname { name: String },
     SetActivePeer { peer_id: Option<String> },
+    DialAddr { peer_id: PeerId, addr: Multiaddr },
 }
 
 struct AppState {
@@ -329,6 +335,7 @@ pub async fn run_p2p(
                         let burl = state.bootstrap_url.lock().unwrap().clone();
                         if let Ok(res) = client.post(format!("{}/qr/scan", burl)).json(&ScanReq { scanner_peer_id: state.local_peer_id.clone(), encrypted_token: token }).send().await {
                             if let Ok(scan) = res.json::<ScanRes>().await {
+                                let mut final_target_id = scan.target_peer_id.clone();
                                 if scan.success {
                                     if let Some(composite) = scan.target_peer_id.clone() {
                                         let parts: Vec<&str> = composite.split(':').collect();
@@ -340,22 +347,49 @@ pub async fn run_p2p(
                                                     let mut arr = [0u8; 32];
                                                     arr.copy_from_slice(&key_bytes);
                                                     let short_id = format!("peer_{}", &x25519_pub[..12]);
+                                                    final_target_id = Some(short_id.clone());
                                                     state.peer_keys.lock().unwrap().insert(short_id.clone(), arr);
                                                     
                                                     if let Some(pid) = get_libp2p_peer_id(ed25519_pub) {
                                                         swarm.behaviour_mut().kad.get_closest_peers(pid);
+                                                        
+                                                        // Fallback: try to get IP from signaling server
+                                                        let ip_req = IpReq { requester_peer_id: state.local_peer_id.clone(), target_peer_id: short_id.clone() };
+                                                        let burl_inner = burl.clone();
+                                                        let client_inner = client.clone();
+                                                        let cmd_tx_inner = state.emitter.handle.state::<P2PHandle>().sender.clone();
+                                                        tokio::spawn(async move {
+                                                            if let Ok(ip_res) = client_inner.post(format!("{}/peer/ip", burl_inner)).json(&ip_req).send().await {
+                                                                if let Ok(ip_data) = ip_res.json::<IpRes>().await {
+                                                                    if let Some(ip) = ip_data.ip {
+                                                                        println!("Backend: Signaling found IP for {}: {}", short_id, ip);
+                                                                        if let Ok(addr) = format!("/ip4/{}/tcp/4001", ip).parse::<Multiaddr>() {
+                                                                            let _ = cmd_tx_inner.send(OutboundCmd::DialAddr { peer_id: pid, addr });
+                                                                        }
+                                                                        if let Ok(addr) = format!("/ip4/{}/udp/4001/quic-v1", ip).parse::<Multiaddr>() {
+                                                                            let _ = cmd_tx_inner.send(OutboundCmd::DialAddr { peer_id: pid, addr });
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        });
                                                     }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                state.emitter.emit(P2PEvent::ScanResult { success: scan.success, message: scan.message, target_peer_id: scan.target_peer_id });
+                                state.emitter.emit(P2PEvent::ScanResult { success: scan.success, message: scan.message, target_peer_id: final_target_id });
                             }
                         }
                     }
                     OutboundCmd::SetActivePeer { peer_id } => {
                         *state.active_peer_id.lock().unwrap() = peer_id;
+                    }
+                    OutboundCmd::DialAddr { peer_id, addr } => {
+                        println!("Backend: Manual dial to found IP: {}", addr);
+                        swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                        let _ = swarm.dial(addr.with(libp2p::multiaddr::Protocol::P2p(peer_id)));
                     }
                     OutboundCmd::SetNickname { name: _ } => {}
                 }
