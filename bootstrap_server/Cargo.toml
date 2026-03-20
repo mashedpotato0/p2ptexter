@@ -3,6 +3,14 @@ name = "bootstrap_server"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
+[[bin]]
+name = "relay"
+path = "src/relay.rs"
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }

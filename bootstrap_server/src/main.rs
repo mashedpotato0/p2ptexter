@@ -1,7 +1,4 @@
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Key, Nonce,
-};
+use aes_gcm::aead::KeyInit;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -17,10 +14,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use libp2p::{
-    core::upgrade,
     identify, kad, noise, relay, tcp, yamux,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId, StreamProtocol,
+    swarm::{NetworkBehaviour, SwarmEvent}, StreamProtocol,
 };
 use futures::StreamExt;
 
