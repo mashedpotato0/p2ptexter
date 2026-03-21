@@ -339,16 +339,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Some(SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. }) => {
-                    println!("Bootstrap: Incoming connection from {} (via {})", send_back_addr, local_addr);
+                    println!("Bootstrap: Incoming connection FROM {} (via {})", send_back_addr, local_addr);
+                }
+                Some(SwarmEvent::OutgoingConnectionError { peer_id, error, .. }) => {
+                    println!("Bootstrap: Outgoing connection error with {:?}: {:?}", peer_id, error);
                 }
                 Some(SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. }) => {
-                    println!("Bootstrap: Connection established with {} ({:?})", peer_id, endpoint);
+                    println!("Bootstrap: Connection established WITH {} ({:?})", peer_id, endpoint);
                 }
                 Some(SwarmEvent::ConnectionClosed { peer_id, cause, .. }) => {
-                    println!("Bootstrap: Connection closed with {}: {:?}", peer_id, cause);
+                    println!("Bootstrap: Connection closed WITH {}: {:?}", peer_id, cause);
                 }
                 Some(SwarmEvent::Behaviour(MyBehaviourEvent::Relay(event))) => {
-                    println!("Bootstrap: Relay Event: {:?}", event);
+                    match event {
+                        relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
+                            println!("Bootstrap: Relay RESERVATION ACCEPTED from {}", src_peer_id);
+                        }
+                        relay::Event::ReservationReqDenied { src_peer_id, .. } => {
+                            println!("Bootstrap: Relay RESERVATION DENIED from {}", src_peer_id);
+                        }
+                        _ => println!("Bootstrap: Relay Event: {:?}", event),
+                    }
                 }
                 Some(SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }))) => {
                     if peer_id == local_peer_id {
