@@ -338,11 +338,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         *info = Some((local_peer_id.to_string(), address.to_string()));
                     }
                 }
-                Some(SwarmEvent::IncomingConnection { .. }) => {
-                    println!("Bootstrap: Incoming connection...");
+                Some(SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. }) => {
+                    println!("Bootstrap: Incoming connection from {} (via {})", send_back_addr, local_addr);
                 }
-                Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {
-                    println!("Bootstrap: Connection established with {}", peer_id);
+                Some(SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. }) => {
+                    println!("Bootstrap: Connection established with {} ({:?})", peer_id, endpoint);
                 }
                 Some(SwarmEvent::ConnectionClosed { peer_id, cause, .. }) => {
                     println!("Bootstrap: Connection closed with {}: {:?}", peer_id, cause);
@@ -351,9 +351,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Bootstrap: Relay Event: {:?}", event);
                 }
                 Some(SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }))) => {
-                    println!("Bootstrap: Identified peer {} with addrs {:?}", peer_id, info.listen_addrs);
-                    for addr in info.listen_addrs {
-                        swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                    if peer_id == local_peer_id {
+                        println!("Bootstrap: Ignoring identify from SELF ({})", peer_id);
+                    } else {
+                        println!("Bootstrap: Identified peer {} with addrs {:?}", peer_id, info.listen_addrs);
+                        for addr in info.listen_addrs {
+                            swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                        }
                     }
                 }
                 Some(SwarmEvent::Behaviour(MyBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, .. }))) => {
