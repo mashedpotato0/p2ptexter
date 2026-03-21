@@ -4,6 +4,8 @@
 /src-tauri/gen
 /src-tauri/Cargo.lock
 
+*.d
+
 # web stuff
 node_modules
 dist
