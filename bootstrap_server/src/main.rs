@@ -276,9 +276,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = std::fs::read(id_path)?;
         libp2p::identity::Keypair::from_protobuf_encoding(&bytes)?
     } else {
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
-        std::fs::write(id_path, keypair.to_protobuf_encoding()?)?;
-        keypair
+        // Fallback to legacy hardcoded key if no saved identity exists
+        let mut secret_bytes: [u8; 32] = [
+            142, 45, 12, 98, 233, 11, 4, 203, 77, 65, 122, 199, 10, 56, 88, 201, 34, 111, 67, 89, 21,
+            102, 23, 155, 90, 78, 110, 222, 44, 33, 19, 7,
+        ];
+        let id = libp2p::identity::Keypair::ed25519_from_bytes(&mut secret_bytes).unwrap();
+        let _ = std::fs::write(id_path, id.to_protobuf_encoding().unwrap_or_default());
+        id
     };
     let local_peer_id = local_keypair.public().to_peer_id();
     println!("=== P2P CONSOLIDATED SERVER ===");
@@ -332,6 +337,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if info.is_none() {
                         *info = Some((local_peer_id.to_string(), address.to_string()));
                     }
+                }
+                Some(SwarmEvent::IncomingConnection { .. }) => {
+                    println!("Bootstrap: Incoming connection...");
+                }
+                Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {
+                    println!("Bootstrap: Connection established with {}", peer_id);
+                }
+                Some(SwarmEvent::ConnectionClosed { peer_id, cause, .. }) => {
+                    println!("Bootstrap: Connection closed with {}: {:?}", peer_id, cause);
+                }
+                Some(SwarmEvent::Behaviour(MyBehaviourEvent::Relay(event))) => {
+                    println!("Bootstrap: Relay Event: {:?}", event);
                 }
                 Some(SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }))) => {
                     println!("Bootstrap: Identified peer {} with addrs {:?}", peer_id, info.listen_addrs);
