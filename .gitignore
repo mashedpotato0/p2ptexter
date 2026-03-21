@@ -33,3 +33,5 @@ build/
 *.deb
 *.rpm
 *.aab
+
+relay-server/target/
