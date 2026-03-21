@@ -1,0 +1,4 @@
+Loaded existing secret key from secret.key
+=== P2P CONSOLIDATED SERVER ===
+Bootstrap/Relay PeerId: 12D3KooWQroXdFZAU9iVqfSyUdmSPdsyuaDSELzfjiSRmKwpNBmX
+Error: Other(Custom { kind: Other, error: Other(Left(Left(Left(Os { code: 98, kind: AddrInUse, message: "Address already in use" })))) })

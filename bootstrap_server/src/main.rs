@@ -13,19 +13,19 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use libp2p::{
-    identify, kad, noise, relay, tcp, yamux,
+    identify, kad, noise, ping, relay, tcp, yamux,
     swarm::{NetworkBehaviour, SwarmEvent}, StreamProtocol,
 };
 use futures::StreamExt;
 
-// server state holding ephemeral connection data
+// Server state holding peer IPs, friend relationships, and ephemeral connection info.
 struct ServerState {
     peer_ips: Mutex<HashMap<String, String>>,
     friend_lists: Mutex<HashMap<String, HashSet<String>>>,
     offline_pings: Mutex<HashMap<String, HashSet<String>>>,
     punch_requests: Mutex<HashMap<String, HashSet<String>>>,
     secret_key: [u8; 32],
-    libp2p_info: Mutex<Option<(String, String)>>, // (PeerId, Multiaddr)
+    libp2p_info: Mutex<Option<(String, String)>>, // (PeerId, Multiaddr) for bootstrap discovery
 }
 
 #[derive(NetworkBehaviour)]
@@ -33,6 +33,7 @@ struct MyBehaviour {
     relay: relay::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
+    ping: ping::Behaviour,
 }
 
 #[derive(Deserialize)]
@@ -87,7 +88,7 @@ struct StatusRes {
     punch_from: Vec<String>,
 }
 
-// encrypt payload for qr code// simplify: no encryption for now as requested
+// Generate an expiring token for QR codes. Simple Base64 for now as requested.
 fn encrypt_token(_key: &[u8; 32], payload: &str) -> String {
     B64.encode(payload)
 }
@@ -109,7 +110,7 @@ async fn register_ip(
     Json(payload): Json<RegisterReq>,
 ) -> StatusCode {
     let ip = addr.ip().to_string();
-    println!("DEBUG: Registering peer {} with IP {}", payload.peer_id, ip);
+    println!("Server: Registering peer {} with IP {}", payload.peer_id, ip);
     state.peer_ips.lock().unwrap().insert(payload.peer_id, ip);
     StatusCode::OK
 }
@@ -121,7 +122,7 @@ async fn generate_qr(
 ) -> Json<QrRes> {
     let exp = now_secs() + payload.validity_secs;
     let raw_token = format!("{}:{}", payload.peer_id, exp);
-    println!("DEBUG: Generating QR token for composite ID: {} (exp: {})", payload.peer_id, exp);
+    println!("Server: Generating QR token for composite ID: {} (exp: {})", payload.peer_id, exp);
     let encrypted_token = encrypt_token(&state.secret_key, &raw_token);
     Json(QrRes { encrypted_token })
 }
@@ -131,9 +132,9 @@ async fn scan_qr(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ScanReq>,
 ) -> (StatusCode, Json<ScanRes>) {
-    println!("DEBUG: Scan attempt by {} with token {}", payload.scanner_peer_id, payload.encrypted_token);
+    println!("Server: Scan attempt by {} with token {}", payload.scanner_peer_id, payload.encrypted_token);
     if let Some(decrypted) = decrypt_token(&state.secret_key, &payload.encrypted_token) {
-        println!("DEBUG: Decrypted internal token: {}", decrypted);
+        println!("Server: Decrypted internal token: {}", decrypted);
         let mut parts: Vec<&str> = decrypted.split(':').collect();
         if parts.len() >= 2 {
             let exp_str = parts.pop().unwrap_or("0");
@@ -141,7 +142,7 @@ async fn scan_qr(
             let exp: u64 = exp_str.parse().unwrap_or(0);
             
             if now_secs() > exp {
-                println!("DEBUG: TOKEN EXPIRED for {}. Current: {}, Exp: {}", target_id, now_secs(), exp);
+                println!("Server: Token expired for {}. Current: {}, Exp: {}", target_id, now_secs(), exp);
                 return (StatusCode::BAD_REQUEST, Json(ScanRes {
                     success: false,
                     message: "qr code expired".into(),
@@ -156,7 +157,7 @@ async fn scan_qr(
                 target_id.clone()
             };
 
-            println!("DEBUG: LINKING FRIENDS: {} <-> {} (raw: {})", payload.scanner_peer_id, target_short_id, target_id);
+            println!("Server: Linking friends: {} <-> {} (raw: {})", payload.scanner_peer_id, target_short_id, target_id);
             let mut friends = state.friend_lists.lock().unwrap();
             friends.entry(payload.scanner_peer_id.clone()).or_default().insert(target_short_id.clone());
             friends.entry(target_short_id).or_default().insert(payload.scanner_peer_id);
@@ -168,7 +169,7 @@ async fn scan_qr(
             }));
         }
     }
-    println!("DEBUG: FAILED scan from {}: Invalid or corrupt token", payload.scanner_peer_id);
+    println!("Server: Failed scan from {}: Invalid or corrupt token", payload.scanner_peer_id);
     (StatusCode::BAD_REQUEST, Json(ScanRes {
         success: false,
         message: "invalid token".into(),
@@ -181,17 +182,17 @@ async fn get_ip(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<IpReq>,
 ) -> (StatusCode, Json<IpRes>) {
-    println!("DEBUG: IP lookup request from {} for {}", payload.requester_peer_id, payload.target_peer_id);
+    println!("Server: IP lookup request from {} for {}", payload.requester_peer_id, payload.target_peer_id);
     let friends = state.friend_lists.lock().unwrap();
     if let Some(target_friends) = friends.get(&payload.target_peer_id) {
         if target_friends.contains(&payload.requester_peer_id) {
             let ips = state.peer_ips.lock().unwrap();
             let ip = ips.get(&payload.target_peer_id).cloned();
-            println!("DEBUG: IP found for {}: {:?}", payload.target_peer_id, ip);
+            println!("Server: IP found for {}: {:?}", payload.target_peer_id, ip);
             return (StatusCode::OK, Json(IpRes { ip }));
         }
     }
-    println!("DEBUG: IP lookup DENIED (not friends) for {} seeing {}", payload.requester_peer_id, payload.target_peer_id);
+    println!("Server: IP lookup denied (not friends) for {} seeing {}", payload.requester_peer_id, payload.target_peer_id);
     (StatusCode::FORBIDDEN, Json(IpRes { ip: None }))
 }
 
@@ -319,8 +320,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 kad: kad::Behaviour::with_config(key.public().to_peer_id(), store, kad_cfg),
                 identify: identify::Behaviour::new(identify::Config::new("/p2ptexter/1.0.0".into(), key.public())),
+                ping: ping::Behaviour::new(ping::Config::new().with_interval(std::time::Duration::from_secs(1))),
             }
         })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
         .build();
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/4001".parse()?)?;
@@ -329,28 +332,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_p2p = state.clone();
     tokio::spawn(async move {
         loop {
-            match swarm.next().await {
-                Some(SwarmEvent::NewListenAddr { address, .. }) => {
+            match swarm.select_next_some().await {
+                SwarmEvent::NewListenAddr { address, .. } => {
                     if address.to_string().contains("127.0.0.1") || address.to_string().contains("::1") { continue; }
                     println!("Bootstrap: libp2p listening on {}", address);
+                    swarm.add_external_address(address.clone());
                     let mut info = state_p2p.libp2p_info.lock().unwrap();
                     if info.is_none() {
                         *info = Some((local_peer_id.to_string(), address.to_string()));
                     }
                 }
-                Some(SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. }) => {
+                SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
                     println!("Bootstrap: Incoming connection FROM {} (via {})", send_back_addr, local_addr);
                 }
-                Some(SwarmEvent::OutgoingConnectionError { peer_id, error, .. }) => {
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     println!("Bootstrap: Outgoing connection error with {:?}: {:?}", peer_id, error);
                 }
-                Some(SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. }) => {
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     println!("Bootstrap: Connection established WITH {} ({:?})", peer_id, endpoint);
                 }
-                Some(SwarmEvent::ConnectionClosed { peer_id, cause, .. }) => {
+                SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                     println!("Bootstrap: Connection closed WITH {}: {:?}", peer_id, cause);
                 }
-                Some(SwarmEvent::Behaviour(MyBehaviourEvent::Relay(event))) => {
+                SwarmEvent::Behaviour(MyBehaviourEvent::Relay(event)) => {
                     match event {
                         relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
                             println!("Bootstrap: Relay RESERVATION ACCEPTED from {}", src_peer_id);
@@ -361,7 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => println!("Bootstrap: Relay Event: {:?}", event),
                     }
                 }
-                Some(SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }))) => {
+                SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                     if peer_id == local_peer_id {
                         println!("Bootstrap: Ignoring identify from SELF ({})", peer_id);
                     } else {
@@ -371,7 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                Some(SwarmEvent::Behaviour(MyBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, .. }))) => {
+                SwarmEvent::Behaviour(MyBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, .. })) => {
                     println!("Bootstrap: Kademlia routing updated for {}", peer);
                 }
                 _ => {}

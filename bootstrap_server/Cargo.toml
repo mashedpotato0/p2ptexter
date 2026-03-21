@@ -7,6 +7,10 @@ edition = "2021"
 name = "bootstrap"
 path = "src/main.rs"
 
+[[bin]]
+name = "test_p2p"
+path = "src/test_p2p.rs"
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
@@ -15,8 +19,9 @@ serde_json = "1.0"
 aes-gcm = "0.10"
 base64 = "0.21"
 rand = "0.8"
-libp2p = { version = "0.53", features = ["tcp", "tls", "quic", "noise", "yamux", "relay", "kad", "identify", "autonat", "tokio", "macros"] }
+libp2p = { version = "0.53", features = ["tcp", "tls", "quic", "noise", "yamux", "relay", "kad", "identify", "ping", "request-response", "cbor", "autonat", "tokio", "macros"] }
 futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
 [profile.release]
 codegen-units = 16
 panic = "abort"
