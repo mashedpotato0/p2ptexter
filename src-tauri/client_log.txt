@@ -1,0 +1,7 @@
+error: unexpected argument '--lib' found
+
+  tip: to pass '--lib' as a value, use '-- --lib'
+
+Usage: cargo run [OPTIONS] [ARGS]...
+
+For more information, try '--help'.

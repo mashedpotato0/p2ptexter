@@ -3,87 +3,45 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use futures::StreamExt;
+use libp2p::{
+    core::upgrade, dcutr, identify, noise, ping, relay, request_response, tcp, yamux,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    Multiaddr, PeerId, StreamProtocol, Transport,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-// sha2 removed as it's no longer used
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::mpsc;
 use x25519_dalek::PublicKey as X25519PublicKey;
-use libp2p::{
-    core::upgrade,
-    dcutr, identify, kad, noise, relay, request_response, tcp, yamux,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId, StreamProtocol, Transport,
-};
-use futures::StreamExt;
-
-// ── types ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "msg_type")]
 enum Envelope {
-    Hello { from: String, pubkey: String, nickname: String },
+    Hello { from: String, pubkey: String, nickname: String, ed25519_pubkey: String },
     Msg { from: String, to: String, nonce: String, ciphertext: String, nickname: String, ts: u64 },
     Punch { from: String },
-    BootstrapInfo { peer_id: String, multiaddr: String }, // Added missing variant
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "event_type")]
 pub enum P2PEvent {
     PeerOnline { peer_id: String, nickname: String },
-    PeerOffline { peer_id: String },
     MessageReceived { peer_id: String, content: String, nickname: String },
-    PeerDiscovered { peer_id: String, nickname: String },
     ListenAddress { content: String },
     KeyExchanged { peer_id: String, nickname: String },
-    BootstrapStatus { status: String },
     ScanResult { success: bool, message: String, target_peer_id: Option<String> },
     PortStatus { success: bool, message: String, details: Option<String> },
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct QueuedMsg {
-    content: String,
-    nickname: String,
-    ts: u64,
-}
-
-// ── bootstrap server types ───────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct RegisterReq { peer_id: String }
-#[derive(Serialize)]
-struct QrReq { peer_id: String, validity_secs: u64 }
-#[derive(Deserialize)]
-struct QrRes { encrypted_token: String }
-#[derive(Serialize)]
-struct ScanReq { scanner_peer_id: String, encrypted_token: String }
-
-#[derive(Serialize)]
-struct IpReq { requester_peer_id: String, target_peer_id: String }
-#[derive(Deserialize)]
-struct IpRes { ip: Option<String> }
-
-#[derive(Deserialize)]
-struct ScanRes {
-    success: bool,
-    message: String,
-    target_peer_id: Option<String>,
-}
-
-// StatusRes removed as it's no longer used
-
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Debug, Clone)]
 struct BootstrapInfo {
     peer_id: String,
-    multiaddr: String,
+    _multiaddr: String,
 }
-
-// ── shared state ─────────────────────────────────────────────────────────────
 
 pub struct P2PHandle {
     sender: mpsc::UnboundedSender<OutboundCmd>,
@@ -100,7 +58,7 @@ pub enum OutboundCmd {
     ScanQr { token: String },
     SetNickname { name: String },
     SetActivePeer { peer_id: Option<String> },
-    DialAddr { peer_id: PeerId, addr: Multiaddr },
+    DialPeer { peer_id: PeerId },
 }
 
 struct AppState {
@@ -109,21 +67,19 @@ struct AppState {
     local_ed25519_pubkey_b64: String,
     local_secret_bytes: [u8; 32],
     peer_keys: Mutex<HashMap<String, [u8; 32]>>,
-    offline_queue: Mutex<HashMap<String, Vec<QueuedMsg>>>,
+    peer_libp2p_ids: Mutex<HashMap<String, PeerId>>,
     active_peer_id: Mutex<Option<String>>,
     nickname: Arc<Mutex<String>>,
-    bootstrap_url: Arc<Mutex<String>>,
     emitter: Arc<TauriEmitter>,
-    libp2p_peer_id: PeerId,
 }
 
 #[derive(NetworkBehaviour)]
 struct AppBehaviour {
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
-    kad: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
-    request_response: request_response::cbor::Behaviour<Envelope, Envelope>, // 1:1 messaging
+    request_response: request_response::cbor::Behaviour<Envelope, Envelope>,
+    ping: ping::Behaviour,
 }
 
 pub struct TauriEmitter {
@@ -136,25 +92,13 @@ impl TauriEmitter {
     }
 }
 
-// ── networking ───────────────────────────────────────────────────────────────
-
-// ── main loop ────────────────────────────────────────────────────────────────
-
-#[tauri::command]
-async fn set_active_peer(peer_id: Option<String>, state: State<'_, P2PHandle>) -> Result<(), String> {
-    let _ = state.sender.send(OutboundCmd::SetActivePeer { peer_id });
-    Ok(())
-}
-
-// ── libp2p helpers ──────────────────────────────────────────────────────────
-
 fn get_libp2p_peer_id(b64_pubkey: &str) -> Option<PeerId> {
     let bytes = B64.decode(b64_pubkey).ok()?;
     let pubkey = libp2p::identity::ed25519::PublicKey::try_from_bytes(&bytes).ok()?;
     Some(PeerId::from_public_key(&libp2p::identity::PublicKey::from(pubkey)))
 }
 
-fn encrypt_message_for_libp2p(to_peer_id: &str, content: &str, state: Arc<AppState>) -> Option<Envelope> {
+fn encrypt_message(to_peer_id: &str, content: &str, state: Arc<AppState>) -> Option<Envelope> {
     let keys = state.peer_keys.lock().unwrap();
     let target_pubkey_bytes = keys.get(to_peer_id)?;
     let pubkey = X25519PublicKey::from(*target_pubkey_bytes);
@@ -179,22 +123,23 @@ fn encrypt_message_for_libp2p(to_peer_id: &str, content: &str, state: Arc<AppSta
     })
 }
 
-async fn process_envelope(env: Envelope, state: Arc<AppState>) {
+async fn process_envelope(peer: PeerId, env: Envelope, state: Arc<AppState>) {
     match env {
-        Envelope::Hello { from, pubkey, nickname } => {
-            println!("Backend: Received Hello from {} ({})", nickname, from);
-            if let Ok(key_bytes) = B64.decode(pubkey) {
+        Envelope::Hello { from, pubkey, nickname, ed25519_pubkey: _ } => {
+            println!("P2P: received hello from {}", nickname);
+            if let Ok(key_bytes) = B64.decode(&pubkey) {
                 if key_bytes.len() == 32 {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&key_bytes);
                     state.peer_keys.lock().unwrap().insert(from.clone(), arr);
+                    state.peer_libp2p_ids.lock().unwrap().insert(from.clone(), peer);
                     state.emitter.emit(P2PEvent::KeyExchanged { peer_id: from.clone(), nickname: nickname.clone() });
                     state.emitter.emit(P2PEvent::PeerOnline { peer_id: from, nickname });
                 }
             }
         }
         Envelope::Msg { from, nonce, ciphertext, nickname, .. } => {
-            println!("Backend: Received encrypted message from {}", nickname);
+            println!("P2P: received encrypted msg from {}", nickname);
             let keys = state.peer_keys.lock().unwrap();
             if let Some(target_pubkey) = keys.get(&from) {
                 let pubkey = X25519PublicKey::from(*target_pubkey);
@@ -219,6 +164,13 @@ async fn process_envelope(env: Envelope, state: Arc<AppState>) {
     }
 }
 
+fn extract_ip(url: &str) -> String {
+    let stripped = url.replace("http://", "").replace("https://", "");
+    let ip_part = stripped.split(':').next().unwrap_or("34.41.180.29"); // Default fallback to production relay
+    ip_part.to_string()
+}
+
+// Main P2P loop managing swarm events and outbound commands.
 pub async fn run_p2p(
     app_handle: tauri::AppHandle,
     mut cmd_rx: mpsc::UnboundedReceiver<OutboundCmd>,
@@ -231,7 +183,7 @@ pub async fn run_p2p(
     let mut secret_bytes_mut = secret_bytes;
     let libp2p_keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut secret_bytes_mut).unwrap();
     let libp2p_peer_id = libp2p_keypair.public().to_peer_id();
-    println!("Backend: libp2p PeerId: {}", libp2p_peer_id);
+    println!("P2P: libp2p peerid: {}", libp2p_peer_id);
 
     let (relay_transport, relay_client) = relay::client::new(libp2p_peer_id);
 
@@ -240,182 +192,215 @@ pub async fn run_p2p(
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
         .with_quic()
         .with_other_transport(|key| relay_transport.upgrade(upgrade::Version::V1).authenticate(noise::Config::new(key).unwrap()).multiplex(yamux::Config::default()))?
-        .with_behaviour(|key: &libp2p::identity::Keypair| {
-            let mut kad_cfg = kad::Config::default();
-            kad_cfg.set_protocol_names(vec![StreamProtocol::new("/p2ptexter/kad/1.0.0")]);
-            let store = kad::store::MemoryStore::new(key.public().to_peer_id());
+        .with_behaviour(|key| {
             AppBehaviour {
                 relay_client,
                 dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
-                kad: kad::Behaviour::with_config(key.public().to_peer_id(), store, kad_cfg),
                 identify: identify::Behaviour::new(identify::Config::new("/p2ptexter/1.0.0".into(), key.public())),
                 request_response: request_response::cbor::Behaviour::new(
                     [(StreamProtocol::new("/p2ptexter/msg/1.0.0"), request_response::ProtocolSupport::Full)],
                     request_response::Config::default()
                 ),
+                ping: ping::Behaviour::new(ping::Config::new().with_interval(std::time::Duration::from_secs(1))),
             }
         })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
         .build();
 
     let ed25519_pubkey_b64 = B64.encode(libp2p_keypair.public().try_into_ed25519().unwrap().to_bytes());
 
     let state = Arc::new(AppState {
         local_peer_id: local_peer_id.clone(),
-        local_pubkey_b64,
-        local_ed25519_pubkey_b64: ed25519_pubkey_b64,
+        local_pubkey_b64: local_pubkey_b64.clone(),
+        local_ed25519_pubkey_b64: ed25519_pubkey_b64.clone(),
         local_secret_bytes: secret_bytes,
         peer_keys: Mutex::new(HashMap::new()),
-        offline_queue: Mutex::new(HashMap::new()),
+        peer_libp2p_ids: Mutex::new(HashMap::new()),
         active_peer_id: Mutex::new(None),
         nickname,
-        bootstrap_url: bootstrap_url.clone(),
         emitter: Arc::new(TauriEmitter { handle: app_handle.clone() }),
-        libp2p_peer_id,
     });
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
 
-    let client = reqwest::Client::new();
-    let mut bootstrap_info: Option<BootstrapInfo> = None;
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    // Dynamic Relay Identity
+    let mut current_relay_peer_id: Option<PeerId> = None;
+    let mut reservation_active = false;
+    let mut listen_on_attempted = false; // track so we only call listen_on once per relay connection
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+
+    println!("P2P: Starting loop with dynamic relay discovery");
 
     loop {
         tokio::select! {
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("Backend: Listening on {}", address);
+                    println!("P2P: listening on {}", address);
                 }
-                SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { .. })) => {
-                    println!("Backend: Relay reservation accepted!");
-                    state.emitter.emit(P2PEvent::PortStatus { success: true, message: "Bridged (Relay/DCUtR)".into(), details: Some("Hole punching active".into()) });
-                }
-                SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, peer_id, .. })) => {
-                    for addr in info.listen_addrs {
-                        swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    println!("P2P: connection established! peer: {}", peer_id);
+                    if Some(peer_id) == current_relay_peer_id && !listen_on_attempted {
+                        println!("P2P: MATCHED relay PeerId — registering relay reservation");
+                        listen_on_attempted = true;
+                        let remote = endpoint.get_remote_address().clone();
+                        // Construct circuit address: /ip4/IP/tcp/4001/p2p/RELAY_ID/p2p-circuit
+                        let relay_addr = remote.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                        println!("P2P: calling listen_on: {}", relay_addr);
+                        if let Err(e) = swarm.listen_on(relay_addr) {
+                            eprintln!("P2P: listen_on relay circuit FAILED: {:?}", e);
+                            listen_on_attempted = false; // allow retry
+                        }
+                    } else if Some(peer_id) != current_relay_peer_id {
+                        // This is a P2P peer connecting, exchange keys
+                        let hello = Envelope::Hello {
+                            from: state.local_peer_id.clone(),
+                            pubkey: state.local_pubkey_b64.clone(),
+                            nickname: state.nickname.lock().unwrap().clone(),
+                            ed25519_pubkey: state.local_ed25519_pubkey_b64.clone(),
+                        };
+                        swarm.behaviour_mut().request_response.send_request(&peer_id, hello);
                     }
                 }
-                SwarmEvent::Behaviour(AppBehaviourEvent::RequestResponse(request_response::Event::Message { message, .. })) => {
+                SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                    println!("P2P: connection closed with {}: {:?}", peer_id, cause);
+                    if Some(peer_id) == current_relay_peer_id {
+                        println!("P2P: relay connection LOST — will reconnect");
+                        current_relay_peer_id = None;
+                        reservation_active = false;
+                        listen_on_attempted = false;
+                    }
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(event)) => {
+                    match event {
+                        relay::client::Event::ReservationReqAccepted { .. } => {
+                            println!("P2P: relay reservation ACCEPTED ✓");
+                            reservation_active = true;
+                            state.emitter.emit(P2PEvent::PortStatus { success: true, message: "bridged".into(), details: Some("ready for p2p".into()) });
+                        }
+                        relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
+                            println!("P2P: relay outbound circuit established via {}", relay_peer_id);
+                        }
+                        relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
+                            println!("P2P: relay inbound circuit from {}", src_peer_id);
+                        }
+                    }
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                    println!("P2P: Identify received from {} — protocols: {:?}", peer_id, info.protocols.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+                    // Log if relay supports hop but don't retry listen_on — already done on ConnectionEstablished
+                    if Some(peer_id) == current_relay_peer_id {
+                        let supports_relay = info.protocols.iter().any(|p| p.to_string() == "/libp2p/circuit/relay/0.2.0/hop");
+                        println!("P2P: relay HOP support = {}, reservation_active = {}", supports_relay, reservation_active);
+                    }
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::RequestResponse(request_response::Event::Message { peer, message, .. })) => {
                     if let request_response::Message::Request { request, channel, .. } = message {
-                        process_envelope(request, state.clone()).await;
+                        process_envelope(peer, request, state.clone()).await;
                         let _ = swarm.behaviour_mut().request_response.send_response(channel, Envelope::Punch { from: local_peer_id.clone() });
                     }
                 }
-                SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(_)) => {
-                    // Hole punching is managed internally; UI notification skipped for now due to type ambiguity
+                SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result })) => {
+                    if result.is_ok() {
+                        println!("P2P: direct connection established to {}", remote_peer_id);
+                    }
                 }
                 _ => {}
             },
             cmd = cmd_rx.recv() => if let Some(cmd) = cmd {
                 match cmd {
                     OutboundCmd::SendMsg { to, content } => {
-                        let mut target_pid: Option<PeerId> = None;
-                        {
-                            let keys = state.peer_keys.lock().unwrap();
-                            if let Some(pk) = keys.get(&to) {
-                                target_pid = get_libp2p_peer_id(&B64.encode(pk));
-                            }
-                        }
-                        if let Some(pid) = target_pid {
-                            if let Some(env) = encrypt_message_for_libp2p(&to, &content, state.clone()) {
+                        let pid_opt = state.peer_libp2p_ids.lock().unwrap().get(&to).cloned();
+                        if let Some(pid) = pid_opt {
+                            if let Some(env) = encrypt_message(&to, &content, state.clone()) {
                                 swarm.behaviour_mut().request_response.send_request(&pid, env);
                             }
                         }
                     }
-                    OutboundCmd::GenerateQr { validity_secs } => {
-                        let burl = state.bootstrap_url.lock().unwrap().clone();
+                    OutboundCmd::GenerateQr { validity_secs: _ } => {
                         let composite_id = format!("{}:{}", state.local_pubkey_b64, state.local_ed25519_pubkey_b64);
-                        if let Ok(res) = client.post(format!("{}/qr/generate", burl)).json(&QrReq { peer_id: composite_id, validity_secs }).send().await {
-                            if let Ok(qr) = res.json::<QrRes>().await {
-                                state.emitter.emit(P2PEvent::ListenAddress { content: qr.encrypted_token });
-                            }
-                        }
+                        state.emitter.emit(P2PEvent::ListenAddress { content: composite_id });
                     }
                     OutboundCmd::ScanQr { token } => {
-                        let burl = state.bootstrap_url.lock().unwrap().clone();
-                        if let Ok(res) = client.post(format!("{}/qr/scan", burl)).json(&ScanReq { scanner_peer_id: state.local_peer_id.clone(), encrypted_token: token }).send().await {
-                            if let Ok(scan) = res.json::<ScanRes>().await {
-                                let mut final_target_id = scan.target_peer_id.clone();
-                                if scan.success {
-                                    if let Some(composite) = scan.target_peer_id.clone() {
-                                        let parts: Vec<&str> = composite.split(':').collect();
-                                        if parts.len() == 2 {
-                                            let x25519_pub = parts[0];
-                                            let ed25519_pub = parts[1];
-                                            if let Ok(key_bytes) = B64.decode(x25519_pub) {
-                                                if key_bytes.len() == 32 {
-                                                    let mut arr = [0u8; 32];
-                                                    arr.copy_from_slice(&key_bytes);
-                                                    let short_id = format!("peer_{}", &x25519_pub[..12]);
-                                                    final_target_id = Some(short_id.clone());
-                                                    state.peer_keys.lock().unwrap().insert(short_id.clone(), arr);
-                                                    
-                                                    if let Some(pid) = get_libp2p_peer_id(ed25519_pub) {
-                                                        swarm.behaviour_mut().kad.get_closest_peers(pid);
-                                                        
-                                                        // Fallback: try to get IP from signaling server
-                                                        let ip_req = IpReq { requester_peer_id: state.local_peer_id.clone(), target_peer_id: short_id.clone() };
-                                                        let burl_inner = burl.clone();
-                                                        let client_inner = client.clone();
-                                                        let cmd_tx_inner = state.emitter.handle.state::<P2PHandle>().sender.clone();
-                                                        tokio::spawn(async move {
-                                                            if let Ok(ip_res) = client_inner.post(format!("{}/peer/ip", burl_inner)).json(&ip_req).send().await {
-                                                                if let Ok(ip_data) = ip_res.json::<IpRes>().await {
-                                                                    if let Some(ip) = ip_data.ip {
-                                                                        println!("Backend: Signaling found IP for {}: {}", short_id, ip);
-                                                                        if let Ok(addr) = format!("/ip4/{}/tcp/4001", ip).parse::<Multiaddr>() {
-                                                                            let _ = cmd_tx_inner.send(OutboundCmd::DialAddr { peer_id: pid, addr });
-                                                                        }
-                                                                        if let Ok(addr) = format!("/ip4/{}/udp/4001/quic-v1", ip).parse::<Multiaddr>() {
-                                                                            let _ = cmd_tx_inner.send(OutboundCmd::DialAddr { peer_id: pid, addr });
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
+                        let parts: Vec<&str> = token.split(':').collect();
+                        if parts.len() == 2 {
+                            let x25519_pub = parts[0];
+                            let ed25519_pub = parts[1];
+                            if let Ok(key_bytes) = B64.decode(x25519_pub) {
+                                if key_bytes.len() == 32 {
+                                    let mut arr = [0u8; 32];
+                                    arr.copy_from_slice(&key_bytes);
+                                    let short_id = format!("peer_{}", &x25519_pub[..12]);
+                                    state.peer_keys.lock().unwrap().insert(short_id.clone(), arr);
+                                    
+                                    if let Some(pid) = get_libp2p_peer_id(ed25519_pub) {
+                                        state.peer_libp2p_ids.lock().unwrap().insert(short_id.clone(), pid);
+                                        let cmd_tx_inner = state.emitter.handle.state::<P2PHandle>().sender.clone();
+                                        let _ = cmd_tx_inner.send(OutboundCmd::DialPeer { peer_id: pid });
                                     }
+                                    state.emitter.emit(P2PEvent::ScanResult { success: true, message: "scan ok".into(), target_peer_id: Some(short_id) });
                                 }
-                                state.emitter.emit(P2PEvent::ScanResult { success: scan.success, message: scan.message, target_peer_id: final_target_id });
                             }
                         }
                     }
                     OutboundCmd::SetActivePeer { peer_id } => {
                         *state.active_peer_id.lock().unwrap() = peer_id;
                     }
-                    OutboundCmd::DialAddr { peer_id, addr } => {
-                        println!("Backend: Manual dial to found IP: {}", addr);
-                        swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
-                        let _ = swarm.dial(addr.with(libp2p::multiaddr::Protocol::P2p(peer_id)));
+                    OutboundCmd::DialPeer { peer_id } => {
+                        let ip = extract_ip(&bootstrap_url.lock().unwrap());
+                        println!("P2P: dialing peer via relay (IP: {}) -> {}", ip, peer_id);
+                        if let Some(rid) = current_relay_peer_id {
+                            if let Ok(base_relay) = format!("/ip4/{}/tcp/4001/p2p/{}", ip, rid).parse::<Multiaddr>() {
+                                let target_addr = base_relay.with(libp2p::multiaddr::Protocol::P2pCircuit).with(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                let _ = swarm.dial(target_addr);
+                            }
+                        } else {
+                            eprintln!("P2P: CANNOT dial peer, relay ID unknown");
+                        }
                     }
-                    OutboundCmd::SetNickname { name: _ } => {}
+                    _ => {}
                 }
             },
             _ = tick.tick() => {
-                let burl = state.bootstrap_url.lock().unwrap().clone();
-                if bootstrap_info.is_none() {
+                let burl = bootstrap_url.lock().unwrap().clone();
+                let ip = extract_ip(&burl);
+                
+                let is_connected = if let Some(rid) = current_relay_peer_id {
+                    swarm.connected_peers().any(|p| *p == rid)
+                } else {
+                    false
+                };
+
+                if !is_connected {
+                    println!("P2P: relay NOT connected, fetching bootstrap info from {}/bootstrap/info", burl);
+                    let client = reqwest::Client::new();
                     if let Ok(res) = client.post(format!("{}/bootstrap/info", burl)).send().await {
-                        if let Ok(info_opt) = res.json::<Option<BootstrapInfo>>().await {
-                            if let Some(info) = info_opt {
-                                if let (Ok(pid), Ok(addr)) = (info.peer_id.parse::<PeerId>(), info.multiaddr.parse::<Multiaddr>()) {
-                                    swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
-                                    let _ = swarm.dial(addr.with(libp2p::multiaddr::Protocol::P2p(pid)));
-                                    bootstrap_info = Some(info);
+                        if let Ok(Some(info)) = res.json::<Option<BootstrapInfo>>().await {
+                            println!("P2P: discovered bootstrap PeerId: {}", info.peer_id);
+                            if let Ok(pid) = info.peer_id.parse::<PeerId>() {
+                                if Some(pid) != current_relay_peer_id {
+                                    println!("P2P: relay PeerId changed or newly discovered: {:?}", pid);
+                                    current_relay_peer_id = Some(pid);
                                 }
                             }
                         }
                     }
                 }
-                let _ = client.post(format!("{}/register", burl)).json(&RegisterReq { peer_id: state.local_peer_id.clone() }).send().await;
+
+                if let Some(rid) = current_relay_peer_id {
+                    if !swarm.connected_peers().any(|p| *p == rid) {
+                        println!("P2P: attempting relay connection to /ip4/{}/tcp/4001/p2p/{}", ip, rid);
+                        if let Ok(addr) = format!("/ip4/{}/tcp/4001/p2p/{}", ip, rid).parse::<Multiaddr>() {
+                            let _ = swarm.dial(addr);
+                        }
+                    } else {
+                        // Already connected, maybe check reservation? Identify should handle it
+                    }
+                }
             }
         }
     }
 }
-
-// ── tauri commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
 fn get_my_peer_id(state: State<'_, P2PHandle>) -> String {
@@ -450,35 +435,28 @@ fn scan_qr(token: String, state: State<'_, P2PHandle>) {
 #[tauri::command]
 async fn reset_identity(app: tauri::AppHandle) -> Result<(), String> {
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    println!("Backend: RESET called. Cleaning dir: {:?}", app_dir);
-
-    let files_to_delete = vec![
-        "p2p_id_v3.txt",
-        "p2p_secret_v3.bin",
-        ".settings.dat", // This is the store file
-    ];
-    
+    let files_to_delete = vec!["p2p_id_v3.txt", "p2p_secret_v3.bin", ".settings.dat"];
     for f_name in files_to_delete {
         let path = app_dir.join(f_name);
         if path.exists() {
-            println!("Backend: Deleting {:?}", path);
             let _ = std::fs::remove_file(path);
         }
     }
-    
-    // Give some time for file system and UI to settle
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    
-    println!("Backend: Cleanup complete. Exiting app to enforce re-init.");
     std::process::exit(0);
 }
+
 #[tauri::command]
 fn set_bootstrap_url(url: String, state: State<'_, P2PHandle>) {
     let mut burl = state.bootstrap_url.lock().unwrap();
     *burl = url;
 }
 
-// ── app entrypoint ────────────────────────────────────────────────────────────
+#[tauri::command]
+async fn set_active_peer(peer_id: Option<String>, state: State<'_, P2PHandle>) -> Result<(), String> {
+    let _ = state.sender.send(OutboundCmd::SetActivePeer { peer_id });
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -493,53 +471,36 @@ pub fn run() {
         .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(tauri_plugin_store::Builder::default().build())
         .setup(move |app| {
-            println!("Backend: Setup starting");
             let app_handle = app.handle().clone();
             let app_dir = app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let key_path = app_dir.join("p2p_id_v3.txt");
             let secret_path = app_dir.join("p2p_secret_v3.bin");
             
-            println!("Backend: App dir: {:?}", app_dir);
             let _ = std::fs::create_dir_all(&app_dir);
 
-            if key_path.exists() {
-                println!("Backend: FOUND legacy id file: {:?}", key_path);
-            }
-            if secret_path.exists() {
-                println!("Backend: FOUND secret key file: {:?}", secret_path);
-            }
-
-            // 1. Load or generate secret bytes
             let mut secret_bytes = [0u8; 32];
             if secret_path.exists() {
                 if let Ok(bytes) = std::fs::read(&secret_path) {
                     if bytes.len() == 32 {
                         secret_bytes.copy_from_slice(&bytes);
-                        println!("Backend: Loaded existing secret key");
                     } else {
                         rand::thread_rng().fill_bytes(&mut secret_bytes);
                         let _ = std::fs::write(&secret_path, &secret_bytes);
-                        println!("Backend: Corrupt secret key, generated new one");
                     }
                 } else {
                     rand::thread_rng().fill_bytes(&mut secret_bytes);
                     let _ = std::fs::write(&secret_path, &secret_bytes);
-                    println!("Backend: Failed to read secret key, generated new one");
                 }
             } else {
                 rand::thread_rng().fill_bytes(&mut secret_bytes);
                 let _ = std::fs::write(&secret_path, &secret_bytes);
-                println!("Backend: Generated and saved new secret key");
             }
 
-            // 2. Derive public key and peer ID
             let static_secret = x25519_dalek::StaticSecret::from(secret_bytes);
             let local_pubkey_b64 = B64.encode(X25519PublicKey::from(&static_secret).as_bytes());
             let peer_id = format!("peer_{}", &local_pubkey_b64[..12]);
             
-            // Save peer_id for reference (legacy compatibility)
             let _ = std::fs::write(&key_path, &peer_id);
-            println!("Backend: Peer ID: {}", peer_id);
 
             app.manage(P2PHandle {
                 sender: cmd_tx,
@@ -547,17 +508,15 @@ pub fn run() {
                 local_pubkey_b64: local_pubkey_b64.clone(),
                 peer_keys,
                 nickname: nickname.clone(),
-                bootstrap_url: bootstrap_url_loop,
+                bootstrap_url,
             });
 
             tauri::async_runtime::spawn(async move {
-                println!("Backend: Spawning run_p2p loop");
-                let res = run_p2p(app_handle, cmd_rx, peer_id, local_pubkey_b64, secret_bytes, nickname, bootstrap_url).await;
+                let res = run_p2p(app_handle, cmd_rx, peer_id, local_pubkey_b64, secret_bytes, nickname, bootstrap_url_loop).await;
                 if let Err(e) = res {
-                    eprintln!("Backend: run_p2p failed: {}", e);
+                    eprintln!("P2P: run_p2p failed: {}", e);
                 }
             });
-            println!("Backend: Setup complete");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

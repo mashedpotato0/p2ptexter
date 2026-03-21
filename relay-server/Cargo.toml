@@ -1,0 +1,8 @@
+[package]
+name = "relay-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libp2p = { version = "0.53", features = ["tcp", "tls", "noise", "yamux", "relay", "identify", "ping", "tokio", "macros"] }
+tokio = { version = "1", features = ["full", "macros"] }

@@ -9,7 +9,7 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::time::Duration;
-use tokio::io::{self, AsyncBufReadExt};
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 #[derive(NetworkBehaviour)]
@@ -67,7 +67,7 @@ pub async fn run_p2p(event_tx: mpsc::UnboundedSender<P2PEvent>) -> Result<P2PHan
                 .validation_mode(gossipsub::ValidationMode::Strict)
                 .message_id_fn(message_id_fn)
                 .build()
-                .map_err(|msg| std::io::Error::new(std::io::Error::Other, msg))?;
+                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::Other, msg))?;
 
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
