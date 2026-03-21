@@ -7,10 +7,6 @@ edition = "2021"
 name = "bootstrap"
 path = "src/main.rs"
 
-[[bin]]
-name = "relay"
-path = "src/relay.rs"
-
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }

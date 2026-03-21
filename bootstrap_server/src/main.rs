@@ -1,4 +1,3 @@
-use aes_gcm::aead::KeyInit;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -272,11 +271,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // --- libp2p Setup ---
-    let libp2p_keypair = libp2p::identity::Keypair::generate_ed25519();
-    let local_peer_id = libp2p_keypair.public().to_peer_id();
-    println!("Bootstrap: libp2p PeerId: {}", local_peer_id);
+    let id_path = std::path::Path::new("p2p_identity.key");
+    let local_keypair = if id_path.exists() {
+        let bytes = std::fs::read(id_path)?;
+        libp2p::identity::Keypair::from_protobuf_encoding(&bytes)?
+    } else {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        std::fs::write(id_path, keypair.to_protobuf_encoding()?)?;
+        keypair
+    };
+    let local_peer_id = local_keypair.public().to_peer_id();
+    println!("=== P2P CONSOLIDATED SERVER ===");
+    println!("Bootstrap/Relay PeerId: {}", local_peer_id);
 
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(libp2p_keypair)
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -290,7 +298,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let store = kad::store::MemoryStore::new(key.public().to_peer_id());
             
             MyBehaviour {
-                relay: relay::Behaviour::new(key.public().to_peer_id(), relay::Config::default()),
+                relay: relay::Behaviour::new(
+                    key.public().to_peer_id(), 
+                    relay::Config {
+                        max_reservations: 1024,
+                        max_reservations_per_peer: 8,
+                        reservation_duration: std::time::Duration::from_secs(60 * 60),
+                        reservation_rate_limiters: vec![],
+                        circuit_src_rate_limiters: vec![],
+                        max_circuits: 1024,
+                        max_circuits_per_peer: 16,
+                        max_circuit_duration: std::time::Duration::from_secs(60 * 2), // 2 mins covers hole punching setup flawlessly
+                        max_circuit_bytes: 4 * 1024 * 1024,
+                    }
+                ),
                 kad: kad::Behaviour::with_config(key.public().to_peer_id(), store, kad_cfg),
                 identify: identify::Behaviour::new(identify::Config::new("/p2ptexter/1.0.0".into(), key.public())),
             }
