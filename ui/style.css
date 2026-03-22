@@ -42,14 +42,14 @@ body {
         radial-gradient(ellipse 80% 60% at 20% 15%, rgba(0, 212, 255, 0.07) 0%, transparent 55%),
         radial-gradient(ellipse 60% 50% at 80% 85%, rgba(124, 111, 255, 0.08) 0%, transparent 55%);
     color: var(--text-primary);
-    height: 100vh;
+    height: 100dvh;
     overflow: hidden;
 }
 
 /* ── layout ────────────────────────────────────────────────────────────────── */
 .app-wrapper {
     display: flex;
-    height: 100vh;
+    height: 100dvh;
 }
 
 .hidden {
@@ -298,6 +298,11 @@ body {
 
 .status-dot.offline {
     background: var(--text-dim);
+}
+
+.status-dot.error {
+    background: #ff4d4d;
+    box-shadow: 0 0 10px rgba(255, 77, 77, 0.5);
 }
 
 .contact-info-text {
@@ -591,12 +596,36 @@ body {
     border-top-left-radius: 4px;
 }
 
-.message-time {
-    font-size: 10px;
-    color: var(--text-dim);
+.message-meta {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     float: right;
     margin-top: 3px;
     margin-left: 10px;
+}
+
+.message-time {
+    font-size: 10px;
+    color: var(--text-dim);
+}
+
+.message-status {
+    font-size: 10px;
+    display: inline-flex;
+    align-items: center;
+}
+
+.status-sending { color: var(--text-muted); animation: status-pulse 1.5s infinite; }
+.status-queued { color: var(--text-dim); }
+.status-delivered { color: var(--accent-cyan); }
+.status-delivered::after { content: '✓✓'; margin-left: -2px; }
+.status-queued::after, .status-sending::after { content: '✓'; }
+
+@keyframes status-pulse {
+    0% { opacity: 0.3; }
+    50% { opacity: 1; }
+    100% { opacity: 0.3; }
 }
 
 /* date separator */

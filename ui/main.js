@@ -107,9 +107,34 @@ async function init() {
             case 'ScanResult': onScanResult(p.success, p.message, p.target_peer_id); break;
             case 'PortStatus': onPortStatus(p.success, p.message, p.details); break;
             case 'BootstrapStatus': onBootstrapStatus(p.status); break;
+            case 'DeliveryStatus': onDeliveryStatus(p.peer_id, p.timestamp, p.success, p.message); break;
+            case 'NicknameUpdate': onPeerOnline(p.peer_id, p.nickname); break;
             default: break;
         }
     });
+
+    // Handle Android Back Button to avoid closing app when in chat
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' || e.key === 'Back') {
+            if (activePeerId) {
+                console.log('main.js: back button intercepted');
+                e.preventDefault();
+                setActivePeer(null);
+            }
+        }
+    });
+
+    // Stabilize layout when keyboard appears
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', () => {
+            const height = window.visualViewport.height;
+            document.body.style.height = `${height}px`;
+            // Ensure we keep the active chat in view if it's open
+            if (activePeerId) {
+                setTimeout(scrollToBottom, 50);
+            }
+        });
+    }
 
     // load saved data from store
     if (store) {
@@ -138,6 +163,8 @@ async function init() {
             }
 
             console.log('main.js: store loaded');
+            // Proactive silent sync to trigger mailbox drains and status updates
+            await invoke('sync_all_peers');
         } catch (e) {
             console.error('main.js: failed to load store', e);
         }
@@ -207,10 +234,16 @@ function onPortStatus(success, message, details) {
         networkStatusDot.className = 'status-dot warning';
         networkStatusText.textContent = message || 'Port Blocked';
         
-        // Custom tooltips for clarity
+        // Custom tooltips and styles for specific errors
         let tooltip = details || 'UDP packets might be blocked by a firewall or ISP';
         if (message === 'Mobile/NAT') {
             tooltip = 'Mobile networks block inbound ports. Pure P2P will use Hole Punching to connect.';
+        } else if (message.includes('Discovery Failed')) {
+            networkStatusDot.className = 'status-dot error';
+            tooltip = details || 'Check your bootstrap URL and server availability (Port 3000).';
+        } else if (message.includes('Relay Failed')) {
+            networkStatusDot.className = 'status-dot error';
+            tooltip = details || 'Could not establish libp2p connection to relay (Port 4001). Check server firewall.';
         }
         
         document.getElementById('network-status').title = tooltip;
@@ -327,10 +360,29 @@ function onSyncComplete(peerId, count) {
     }
 }
 
-function onMessageReceived(peerId, content, nickname) {
-    if (!peers.has(peerId)) {
-        onPeerDiscovered(peerId, nickname);
+function onDeliveryStatus(peerId, ts, success, statusMsg) {
+    console.log('delivery status', peerId, ts, success, statusMsg);
+    const peerMsgs = messages.get(peerId);
+    if (!peerMsgs) return;
+    
+    // Rust ts is in seconds.
+    const msg = peerMsgs.find(m => m.ts === ts || (m.ts && Math.abs(m.ts - ts) <= 1));
+    if (msg) {
+        msg.status = success ? 'delivered' : 'queued';
+        msg.statusMsg = statusMsg;
+
+        // If it was queued (success=false), mark peer offline immediately in UI
+        if (!success) {
+            onPeerOffline(peerId);
+        }
+
+        if (activePeerId === peerId) renderMessages();
+        saveState();
     }
+}
+
+function onMessageReceived(peerId, content, nickname) {
+    onPeerDiscovered(peerId, nickname);
 
     const t = timeStr();
     const p = peers.get(peerId);
@@ -401,7 +453,20 @@ function renderMessages() {
     msgs.forEach(msg => {
         const el = document.createElement('div');
         el.className = `message ${msg.sent ? 'sent' : 'received'}`;
-        el.innerHTML = `${escHtml(msg.text)}<span class="message-time">${msg.time}</span>`;
+        
+        let statusHtml = '';
+        if (msg.sent) {
+            const statusClass = msg.status === 'delivered' ? 'status-delivered' : 
+                               (msg.status === 'queued' ? 'status-queued' : 'status-sending');
+            // Icon is now handled by CSS ::after
+            statusHtml = `<span class="message-status ${statusClass}" title="${msg.statusMsg || ''}"></span>`;
+        }
+
+        el.innerHTML = `${escHtml(msg.text)}
+            <div class="message-meta">
+                <span class="message-time">${msg.time}</span>
+                ${statusHtml}
+            </div>`;
         messageListEl.appendChild(el);
     });
 
@@ -451,9 +516,16 @@ async function sendMessage() {
         await invoke('send_p2p_message', { to: activePeerId, content: text });
 
         const t = timeStr();
-        const ts = Date.now();
+        const ts = Math.floor(Date.now() / 1000);
         if (!messages.has(activePeerId)) messages.set(activePeerId, []);
-        messages.get(activePeerId).push({ text, sent: true, time: t, nick: myNickname, ts });
+        messages.get(activePeerId).push({ 
+            text, 
+            sent: true, 
+            time: t, 
+            nick: myNickname, 
+            ts, 
+            status: 'sending' 
+        });
 
         const p = peers.get(activePeerId);
         if (p) { p.lastMsg = text; p.lastTime = t; }

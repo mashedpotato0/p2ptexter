@@ -5,7 +5,9 @@ use aes_gcm::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures::StreamExt;
 use libp2p::{
-    core::upgrade, dcutr, identify, noise, ping, relay, request_response, tcp, yamux,
+    core::upgrade, dcutr, identify, noise, ping, relay, 
+    request_response::{self, OutboundRequestId}, 
+    tcp, yamux,
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Transport,
 };
@@ -14,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs;
 use tauri::{Emitter, Manager, State};
 use tokio::sync::mpsc;
 use x25519_dalek::PublicKey as X25519PublicKey;
@@ -24,22 +28,31 @@ enum Envelope {
     Hello { from: String, pubkey: String, nickname: String, ed25519_pubkey: String },
     Msg { from: String, to: String, nonce: String, ciphertext: String, nickname: String, ts: u64 },
     Punch { from: String },
+    NicknameUpdate { from: String, nickname: String },
+    Heartbeat { from: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "event_type")]
 pub enum P2PEvent {
     PeerOnline { peer_id: String, nickname: String },
+    PeerOffline { peer_id: String },
+    PeerDiscovered { peer_id: String, nickname: String },
+    PeerExpired { peer_id: String },
     MessageReceived { peer_id: String, content: String, nickname: String },
+    SyncComplete { peer_id: String, count: usize },
     ListenAddress { content: String },
     KeyExchanged { peer_id: String, nickname: String },
     ScanResult { success: bool, message: String, target_peer_id: Option<String> },
     PortStatus { success: bool, message: String, details: Option<String> },
+    BootstrapStatus { status: String },
+    DeliveryStatus { peer_id: String, timestamp: u64, success: bool, message: String },
 }
 
 #[derive(Deserialize, Debug, Clone)]
 struct BootstrapInfo {
     peer_id: String,
+    #[serde(rename = "multiaddr")]
     _multiaddr: String,
 }
 
@@ -59,6 +72,20 @@ pub enum OutboundCmd {
     SetNickname { name: String },
     SetActivePeer { peer_id: Option<String> },
     DialPeer { peer_id: PeerId },
+    SilentSync,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PersistedPeers {
+    keys: HashMap<String, String>,
+    libp2p_ids: HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct QueuedMessage {
+    target_peer_id: String, // short ID
+    envelope: Envelope,
+    timestamp: u64,
 }
 
 struct AppState {
@@ -71,6 +98,11 @@ struct AppState {
     active_peer_id: Mutex<Option<String>>,
     nickname: Arc<Mutex<String>>,
     emitter: Arc<TauriEmitter>,
+    pending_outbound: Mutex<HashMap<OutboundRequestId, QueuedMessage>>,
+    offline_queue: Mutex<Vec<QueuedMessage>>,
+    mailbox_path: std::path::PathBuf,
+    peers_path: std::path::PathBuf,
+    last_seen: Mutex<HashMap<String, u64>>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -123,23 +155,125 @@ fn encrypt_message(to_peer_id: &str, content: &str, state: Arc<AppState>) -> Opt
     })
 }
 
-async fn process_envelope(peer: PeerId, env: Envelope, state: Arc<AppState>) {
+fn save_queue(queue: &[QueuedMessage], path: &std::path::Path) {
+    if let Ok(json) = serde_json::to_string(queue) {
+        let _ = fs::write(path, json);
+    }
+}
+
+fn load_queue(path: &std::path::Path) -> Vec<QueuedMessage> {
+    if let Ok(data) = fs::read_to_string(path) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+fn save_peers(state: &Arc<AppState>) {
+    let keys_map = state.peer_keys.lock().unwrap();
+    let pids_map = state.peer_libp2p_ids.lock().unwrap();
+    
+    let mut keys = HashMap::new();
+    for (sid, key) in keys_map.iter() {
+        keys.insert(sid.clone(), B64.encode(key));
+    }
+    
+    let mut libp2p_ids = HashMap::new();
+    for (sid, pid) in pids_map.iter() {
+        libp2p_ids.insert(sid.clone(), pid.to_base58());
+    }
+    
+    let persisted = PersistedPeers { keys, libp2p_ids };
+    if let Ok(json) = serde_json::to_string(&persisted) {
+        let _ = fs::write(&state.peers_path, json);
+    }
+}
+
+fn load_peers(path: &std::path::Path) -> PersistedPeers {
+    if let Ok(data) = fs::read_to_string(path) {
+        serde_json::from_str::<PersistedPeers>(&data).unwrap_or(PersistedPeers {
+            keys: HashMap::new(),
+            libp2p_ids: HashMap::new(),
+        })
+    } else {
+        PersistedPeers {
+            keys: HashMap::new(),
+            libp2p_ids: HashMap::new(),
+        }
+    }
+}
+
+fn sync_offline_messages(peer_id: &PeerId, swarm: &mut libp2p::Swarm<AppBehaviour>, state: Arc<AppState>) {
+    // Find if we have a short ID for this libp2p peer_id
+    let short_id_opt = {
+        let pids = state.peer_libp2p_ids.lock().unwrap();
+        pids.iter().find(|(_, &v)| v == *peer_id).map(|(k, _)| k.clone())
+    };
+
+    if let Some(short_id) = short_id_opt {
+        let mut q = state.offline_queue.lock().unwrap();
+        let mut to_send = Vec::new();
+        let mut remaining = Vec::new();
+
+        for msg in q.drain(..) {
+            if msg.target_peer_id == short_id {
+                to_send.push(msg);
+            } else {
+                remaining.push(msg);
+            }
+        }
+        *q = remaining;
+        save_queue(&q, &state.mailbox_path);
+
+        for msg in to_send {
+            println!("P2P: re-sending queued message to {}", msg.target_peer_id);
+            let req_id = swarm.behaviour_mut().request_response.send_request(peer_id, msg.envelope.clone());
+            state.pending_outbound.lock().unwrap().insert(req_id, msg);
+        }
+    }
+}
+
+async fn process_envelope(peer: PeerId, env: Envelope, state: Arc<AppState>) -> Option<PeerId> {
+    // Update last_seen for any incoming envelope with a 'from' field
+    let sender_id = match &env {
+        Envelope::Hello { from, .. } => Some(from.clone()),
+        Envelope::Msg { from, .. } => Some(from.clone()),
+        Envelope::Punch { from } => Some(from.clone()),
+        Envelope::NicknameUpdate { from, .. } => Some(from.clone()),
+        Envelope::Heartbeat { from } => Some(from.clone()),
+    };
+    
+    if let Some(sid) = sender_id {
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        state.last_seen.lock().unwrap().insert(sid, ts);
+    }
+
     match env {
-        Envelope::Hello { from, pubkey, nickname, ed25519_pubkey: _ } => {
+        Envelope::Hello { from, pubkey, nickname, .. } => {
             println!("P2P: received hello from {}", nickname);
             if let Ok(key_bytes) = B64.decode(&pubkey) {
                 if key_bytes.len() == 32 {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&key_bytes);
-                    state.peer_keys.lock().unwrap().insert(from.clone(), arr);
+                    state.peer_keys.lock().unwrap().insert(from.clone(), arr.clone());
                     state.peer_libp2p_ids.lock().unwrap().insert(from.clone(), peer);
+                    save_peers(&state); // Persist immediately on new hello
                     state.emitter.emit(P2PEvent::KeyExchanged { peer_id: from.clone(), nickname: nickname.clone() });
                     state.emitter.emit(P2PEvent::PeerOnline { peer_id: from, nickname });
+                    return Some(peer);
                 }
             }
         }
-        Envelope::Msg { from, nonce, ciphertext, nickname, .. } => {
+        Envelope::NicknameUpdate { from, nickname } => {
+            println!("P2P: received nickname update from {}: {}", from, nickname);
+            state.emitter.emit(P2PEvent::PeerOnline { peer_id: from, nickname });
+            return Some(peer);
+        }
+        Envelope::Msg { from, to: _, nonce, ciphertext, nickname, ts: _ } => {
             println!("P2P: received encrypted msg from {}", nickname);
+            
+            let mut decrypted_content = ciphertext.clone();
+            
             let keys = state.peer_keys.lock().unwrap();
             if let Some(target_pubkey) = keys.get(&from) {
                 let pubkey = X25519PublicKey::from(*target_pubkey);
@@ -149,19 +283,34 @@ async fn process_envelope(peer: PeerId, env: Envelope, state: Arc<AppState>) {
                 let key = Key::<Aes256Gcm>::from_slice(shared.as_bytes());
                 let cipher = Aes256Gcm::new(key);
                 
-                if let Ok(nonce_bytes) = B64.decode(nonce) {
-                    if let Ok(cipher_bytes) = B64.decode(ciphertext) {
+                if let Ok(nonce_bytes) = B64.decode(&nonce) {
+                    if let Ok(cipher_bytes) = B64.decode(&ciphertext) {
                         if let Ok(plaintext) = cipher.decrypt(Nonce::from_slice(&nonce_bytes), cipher_bytes.as_ref()) {
                             if let Ok(content) = String::from_utf8(plaintext) {
-                                state.emitter.emit(P2PEvent::MessageReceived { peer_id: from, content, nickname });
+                                decrypted_content = content;
                             }
                         }
                     }
                 }
             }
+
+            state.emitter.emit(P2PEvent::MessageReceived { 
+                peer_id: from.clone(), 
+                content: decrypted_content,
+                nickname: nickname.clone() 
+            });
+            return Some(peer);
         }
-        _ => {}
+        Envelope::Punch { from } => {
+            println!("P2P: received punch (ack) from {}", from);
+            return Some(peer);
+        }
+        Envelope::Heartbeat { from: _ } => {
+            // Updated last_seen above, nothing else to do
+            return Some(peer);
+        }
     }
+    None
 }
 
 fn extract_ip(url: &str) -> String {
@@ -209,16 +358,47 @@ pub async fn run_p2p(
 
     let ed25519_pubkey_b64 = B64.encode(libp2p_keypair.public().try_into_ed25519().unwrap().to_bytes());
 
+    let mailbox_path = app_handle.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let _ = fs::create_dir_all(&mailbox_path);
+    let mailbox_path_file = mailbox_path.join("mailbox.json");
+    let peers_path_file = mailbox_path.join("peers.json");
+    let initial_queue = load_queue(&mailbox_path_file);
+    let initial_peers = load_peers(&peers_path_file);
+
+    // Inflate maps from persisted peers
+    let mut peer_keys = HashMap::new();
+    for (sid, b64_key) in initial_peers.keys {
+        if let Ok(key_bytes) = B64.decode(b64_key) {
+            if key_bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&key_bytes);
+                peer_keys.insert(sid, arr);
+            }
+        }
+    }
+    
+    let mut peer_libp2p_ids = HashMap::new();
+    for (sid, b58_pid) in initial_peers.libp2p_ids {
+        if let Ok(pid) = b58_pid.parse::<PeerId>() {
+            peer_libp2p_ids.insert(sid, pid);
+        }
+    }
+
     let state = Arc::new(AppState {
         local_peer_id: local_peer_id.clone(),
         local_pubkey_b64: local_pubkey_b64.clone(),
         local_ed25519_pubkey_b64: ed25519_pubkey_b64.clone(),
         local_secret_bytes: secret_bytes,
-        peer_keys: Mutex::new(HashMap::new()),
-        peer_libp2p_ids: Mutex::new(HashMap::new()),
+        peer_keys: Mutex::new(peer_keys),
+        peer_libp2p_ids: Mutex::new(peer_libp2p_ids),
         active_peer_id: Mutex::new(None),
         nickname,
         emitter: Arc::new(TauriEmitter { handle: app_handle.clone() }),
+        pending_outbound: Mutex::new(HashMap::new()),
+        offline_queue: Mutex::new(initial_queue),
+        mailbox_path: mailbox_path_file,
+        peers_path: peers_path_file,
+        last_seen: Mutex::new(HashMap::new()),
     });
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
@@ -228,9 +408,11 @@ pub async fn run_p2p(
     let mut current_relay_peer_id: Option<PeerId> = None;
     let mut reservation_active = false;
     let mut listen_on_attempted = false; // track so we only call listen_on once per relay connection
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut heartbeat_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut expiry_tick = tokio::time::interval(std::time::Duration::from_secs(10));
 
-    println!("P2P: Starting loop with dynamic relay discovery");
+    println!("P2P: Starting loop with dynamic relay discovery and heartbeats");
 
     loop {
         tokio::select! {
@@ -240,6 +422,7 @@ pub async fn run_p2p(
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     println!("P2P: connection established! peer: {}", peer_id);
+                    sync_offline_messages(&peer_id, &mut swarm, state.clone());
                     if Some(peer_id) == current_relay_peer_id && !listen_on_attempted {
                         println!("P2P: MATCHED relay PeerId — registering relay reservation");
                         listen_on_attempted = true;
@@ -269,6 +452,16 @@ pub async fn run_p2p(
                         current_relay_peer_id = None;
                         reservation_active = false;
                         listen_on_attempted = false;
+                        state.emitter.emit(P2PEvent::PortStatus { success: false, message: "Relay Lost".into(), details: Some("Connection to bootstrap server closed.".into()) });
+                    }
+                }
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    if let Some(pid) = peer_id {
+                        if Some(pid) == current_relay_peer_id {
+                            println!("P2P: relay OUTGOING connection error: {:?}", error);
+                            listen_on_attempted = false; // allow retry
+                            reservation_active = false;
+                        }
                     }
                 }
                 SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(event)) => {
@@ -277,6 +470,10 @@ pub async fn run_p2p(
                             println!("P2P: relay reservation ACCEPTED ✓");
                             reservation_active = true;
                             state.emitter.emit(P2PEvent::PortStatus { success: true, message: "bridged".into(), details: Some("ready for p2p".into()) });
+                            
+                            // PROACTIVE: Try to sync all known peers now that we have a relay
+                            let sender = state.emitter.handle.state::<P2PHandle>().sender.clone();
+                            let _ = sender.send(OutboundCmd::SilentSync);
                         }
                         relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
                             println!("P2P: relay outbound circuit established via {}", relay_peer_id);
@@ -295,9 +492,38 @@ pub async fn run_p2p(
                     }
                 }
                 SwarmEvent::Behaviour(AppBehaviourEvent::RequestResponse(request_response::Event::Message { peer, message, .. })) => {
-                    if let request_response::Message::Request { request, channel, .. } = message {
-                        process_envelope(peer, request, state.clone()).await;
-                        let _ = swarm.behaviour_mut().request_response.send_response(channel, Envelope::Punch { from: local_peer_id.clone() });
+                    match message {
+                        request_response::Message::Request { request, channel, .. } => {
+                            if let Some(sync_peer) = process_envelope(peer, request, state.clone()).await {
+                                sync_offline_messages(&sync_peer, &mut swarm, state.clone());
+                            }
+                            let _ = swarm.behaviour_mut().request_response.send_response(channel, Envelope::Punch { from: local_peer_id.clone() });
+                        }
+                        request_response::Message::Response { request_id, .. } => {
+                            if let Some(qm) = state.pending_outbound.lock().unwrap().remove(&request_id) {
+                                println!("P2P: message delivered to {}", qm.target_peer_id);
+                                state.emitter.emit(P2PEvent::DeliveryStatus { 
+                                    peer_id: qm.target_peer_id, 
+                                    timestamp: qm.timestamp, 
+                                    success: true, 
+                                    message: "delivered".into() 
+                                });
+                            }
+                        }
+                    }
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::RequestResponse(request_response::Event::OutboundFailure { request_id, error, .. })) => {
+                    if let Some(qm) = state.pending_outbound.lock().unwrap().remove(&request_id) {
+                        println!("P2P: delivery FAILED to {}: {:?}. Queuing...", qm.target_peer_id, error);
+                        let mut q = state.offline_queue.lock().unwrap();
+                        q.push(qm.clone());
+                        save_queue(&q, &state.mailbox_path);
+                        state.emitter.emit(P2PEvent::DeliveryStatus { 
+                            peer_id: qm.target_peer_id, 
+                            timestamp: qm.timestamp, 
+                            success: false, 
+                            message: format!("queued (retry: {:?})", error) 
+                        });
                     }
                 }
                 SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result })) => {
@@ -313,7 +539,32 @@ pub async fn run_p2p(
                         let pid_opt = state.peer_libp2p_ids.lock().unwrap().get(&to).cloned();
                         if let Some(pid) = pid_opt {
                             if let Some(env) = encrypt_message(&to, &content, state.clone()) {
-                                swarm.behaviour_mut().request_response.send_request(&pid, env);
+                                let req_id = swarm.behaviour_mut().request_response.send_request(&pid, env.clone());
+                                let qm = QueuedMessage {
+                                    target_peer_id: to.clone(),
+                                    envelope: env,
+                                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                                };
+                                state.pending_outbound.lock().unwrap().insert(req_id, qm);
+                            }
+                        } else {
+                            // Peer offline/unknown — add to queue immediately
+                            if let Some(env) = encrypt_message(&to, &content, state.clone()) {
+                                println!("P2P: peer {} unknown, queuing message", to);
+                                let qm = QueuedMessage {
+                                    target_peer_id: to.clone(),
+                                    envelope: env,
+                                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                                };
+                                let mut q = state.offline_queue.lock().unwrap();
+                                q.push(qm);
+                                save_queue(&q, &state.mailbox_path);
+                                state.emitter.emit(P2PEvent::DeliveryStatus { 
+                                    peer_id: to, 
+                                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), 
+                                    success: false, 
+                                    message: "queued (offline)".into() 
+                                });
                             }
                         }
                     }
@@ -335,6 +586,7 @@ pub async fn run_p2p(
                                     
                                     if let Some(pid) = get_libp2p_peer_id(ed25519_pub) {
                                         state.peer_libp2p_ids.lock().unwrap().insert(short_id.clone(), pid);
+                                        save_peers(&state); // Persist immediately
                                         let cmd_tx_inner = state.emitter.handle.state::<P2PHandle>().sender.clone();
                                         let _ = cmd_tx_inner.send(OutboundCmd::DialPeer { peer_id: pid });
                                     }
@@ -344,7 +596,24 @@ pub async fn run_p2p(
                         }
                     }
                     OutboundCmd::SetActivePeer { peer_id } => {
-                        *state.active_peer_id.lock().unwrap() = peer_id;
+                        let mut active = state.active_peer_id.lock().unwrap();
+                        *active = peer_id;
+                    }
+                    OutboundCmd::SilentSync => {
+                        let pids = state.peer_libp2p_ids.lock().unwrap().clone();
+                        for (sid, pid) in pids {
+                            // If we have any offline messages for this peer, dial them to trigger sync
+                            println!("P2P: proactive silent sync dial to {}", sid);
+                            let _ = swarm.dial(pid);
+                            // Also send a Hello if we are already connected to trigger sync from their side
+                            let hello = Envelope::Hello {
+                                from: state.local_peer_id.clone(),
+                                pubkey: state.local_pubkey_b64.clone(),
+                                nickname: state.nickname.lock().unwrap().clone(),
+                                ed25519_pubkey: state.local_ed25519_pubkey_b64.clone(),
+                            };
+                            swarm.behaviour_mut().request_response.send_request(&pid, hello);
+                        }
                     }
                     OutboundCmd::DialPeer { peer_id } => {
                         let ip = extract_ip(&bootstrap_url.lock().unwrap());
@@ -358,7 +627,23 @@ pub async fn run_p2p(
                             eprintln!("P2P: CANNOT dial peer, relay ID unknown");
                         }
                     }
-                    _ => {}
+                    OutboundCmd::SetNickname { name } => {
+                        println!("P2P: Setting local nickname to: {}", name);
+                        *state.nickname.lock().unwrap() = name.clone();
+                        
+                        // Broadcast update to all connected peers (not the relay)
+                        let update = Envelope::NicknameUpdate { 
+                            from: local_peer_id.clone(), 
+                            nickname: name 
+                        };
+                        let peers: Vec<_> = swarm.connected_peers().cloned().collect();
+                        for peer in peers {
+                            if Some(peer) != current_relay_peer_id {
+                                println!("P2P: broadcasting nickname update to {}", peer);
+                                swarm.behaviour_mut().request_response.send_request(&peer, update.clone());
+                            }
+                        }
+                    }
                 }
             },
             _ = tick.tick() => {
@@ -372,17 +657,63 @@ pub async fn run_p2p(
                 };
 
                 if !is_connected {
+                    state.emitter.emit(P2PEvent::PortStatus { 
+                        success: false, 
+                        message: "Searching...".into(), 
+                        details: Some(format!("Connecting to bootstrap info at {}...", burl)) 
+                    });
                     println!("P2P: relay NOT connected, fetching bootstrap info from {}/bootstrap/info", burl);
                     let client = reqwest::Client::new();
-                    if let Ok(res) = client.post(format!("{}/bootstrap/info", burl)).send().await {
-                        if let Ok(Some(info)) = res.json::<Option<BootstrapInfo>>().await {
-                            println!("P2P: discovered bootstrap PeerId: {}", info.peer_id);
-                            if let Ok(pid) = info.peer_id.parse::<PeerId>() {
-                                if Some(pid) != current_relay_peer_id {
-                                    println!("P2P: relay PeerId changed or newly discovered: {:?}", pid);
-                                    current_relay_peer_id = Some(pid);
+                    let url = format!("{}/bootstrap/info", burl);
+                    match client.post(&url).send().await {
+                        Ok(res) => {
+                            let status = res.status();
+                            let text = res.text().await.unwrap_or_default();
+                            println!("P2P: discovery response from {}: status={}, body={}", url, status, text);
+                            
+                            if status.is_success() {
+                                if let Ok(info) = serde_json::from_str::<Option<BootstrapInfo>>(&text) {
+                                    if let Some(info) = info {
+                                        println!("P2P: discovered bootstrap PeerId: {}", info.peer_id);
+                                        if let Ok(pid) = info.peer_id.parse::<PeerId>() {
+                                            if Some(pid) != current_relay_peer_id {
+                                                println!("P2P: relay PeerId changed or newly discovered: {:?}", pid);
+                                                current_relay_peer_id = Some(pid);
+                                            }
+                                        }
+                                    } else {
+                                        println!("P2P: relay info returned 'null' (None)");
+                                        state.emitter.emit(P2PEvent::PortStatus { 
+                                            success: false, 
+                                            message: "Relay Refused".into(), 
+                                            details: Some("Server is running but has not established its P2P identity yet.".into()) 
+                                        });
+                                    }
+                                } else {
+                                    println!("P2P: FAILED to parse bootstrap info JSON: {}", text);
+                                    state.emitter.emit(P2PEvent::PortStatus { 
+                                        success: false, 
+                                        message: "Relay Error".into(), 
+                                        details: Some(format!("Invalid response format from relay: {}", text)) 
+                                    });
                                 }
+                            } else {
+                                println!("P2P: discovery HTTP error: {}", status);
+                                state.emitter.emit(P2PEvent::PortStatus { 
+                                    success: false, 
+                                    message: format!("Relay HTTP {}", status).into(), 
+                                    details: Some(format!("The server at {} returned an error.", burl)) 
+                                });
                             }
+                        }
+                        Err(e) => {
+                            println!("P2P: FAILED to reach bootstrap info at {}: {:?}", url, e);
+                            let err_msg = if e.is_timeout() { "Relay Timeout" } else { "Relay Offline" };
+                            state.emitter.emit(P2PEvent::PortStatus { 
+                                success: false, 
+                                message: err_msg.into(), 
+                                details: Some(format!("{}. Check URL: {}", e, burl)) 
+                            });
                         }
                     }
                 }
@@ -396,6 +727,30 @@ pub async fn run_p2p(
                     } else {
                         // Already connected, maybe check reservation? Identify should handle it
                     }
+                }
+            },
+            _ = heartbeat_tick.tick() => {
+                let pids = state.peer_libp2p_ids.lock().unwrap().clone();
+                for (_, pid) in pids {
+                    let hb = Envelope::Heartbeat { from: state.local_peer_id.clone() };
+                    swarm.behaviour_mut().request_response.send_request(&pid, hb);
+                }
+            },
+            _ = expiry_tick.tick() => {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let mut last_seen = state.last_seen.lock().unwrap();
+                let mut to_offline = Vec::new();
+                
+                for (sid, ts) in last_seen.iter() {
+                    if now - ts > 60 {
+                        to_offline.push(sid.clone());
+                    }
+                }
+                
+                for sid in to_offline {
+                    println!("P2P: peer {} timed out (60s inactivity)", sid);
+                    last_seen.remove(&sid);
+                    state.emitter.emit(P2PEvent::PeerOffline { peer_id: sid });
                 }
             }
         }
@@ -430,6 +785,11 @@ fn generate_qr(validity: u64, state: State<'_, P2PHandle>) {
 #[tauri::command]
 fn scan_qr(token: String, state: State<'_, P2PHandle>) {
     let _ = state.sender.send(OutboundCmd::ScanQr { token });
+}
+
+#[tauri::command]
+fn sync_all_peers(state: State<'_, P2PHandle>) {
+    let _ = state.sender.send(OutboundCmd::SilentSync);
 }
 
 #[tauri::command]
@@ -529,6 +889,7 @@ pub fn run() {
             reset_identity,
             set_bootstrap_url,
             set_active_peer,
+            sync_all_peers,
         ])
         .run(tauri::generate_context!())
         .expect("error running app");

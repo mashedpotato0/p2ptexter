@@ -238,6 +238,7 @@ async fn get_bootstrap_info(
     State(state): State<Arc<ServerState>>,
 ) -> Json<Option<BootstrapInfo>> {
     let info = state.libp2p_info.lock().unwrap();
+    println!("Server: [GET_INFO] current state: {:?}", info);
     Json(info.as_ref().map(|(id, addr)| BootstrapInfo { 
         peer_id: id.clone(), 
         multiaddr: addr.clone() 
@@ -246,6 +247,10 @@ async fn get_bootstrap_info(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    let external_ip = args.iter().position(|r| r == "--external-ip")
+        .and_then(|i| args.get(i + 1));
+
     let key_path = std::path::Path::new("secret.key");
     let mut secret_key = [0u8; 32];
     
@@ -289,6 +294,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local_peer_id = local_keypair.public().to_peer_id();
     println!("=== P2P CONSOLIDATED SERVER ===");
     println!("Bootstrap/Relay PeerId: {}", local_peer_id);
+
+    if let Some(ip) = external_ip {
+        let addr = format!("/ip4/{}/tcp/4001", ip);
+        println!("Server: Explicit EXTERNAL_IP provided: {}", ip);
+        let mut info = state.libp2p_info.lock().unwrap();
+        *info = Some((local_peer_id.to_string(), addr));
+    }
+
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_keypair)
         .with_tokio()
@@ -336,10 +349,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     if address.to_string().contains("127.0.0.1") || address.to_string().contains("::1") { continue; }
                     println!("Bootstrap: libp2p listening on {}", address);
+                    
+                    // Always add as external so the relay knows it can be used for reservations
                     swarm.add_external_address(address.clone());
+
                     let mut info = state_p2p.libp2p_info.lock().unwrap();
                     if info.is_none() {
+                        // Only auto-fill if no external IP was provided via CLI
+                        println!("Server: [AUTO-INFO] setting libp2p_info from listen address: {}", address);
                         *info = Some((local_peer_id.to_string(), address.to_string()));
+                    } else {
+                        println!("Server: [AUTO-INFO] skipping auto-fill, info already set: {:?}", info);
                     }
                 }
                 SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
